@@ -31,6 +31,20 @@ logger = logging.getLogger(__name__)
 
 MAX_API = "https://platform-api.max.ru"
 MAX_ATTACHMENT_TYPES = {"image", "file", "voice", "video", "audio", "contact", "inline_keyboard", "clipboard", "location"}
+MAX_NATIVE_COMMANDS = [
+    {"name": "help", "description": "Show available commands."},
+    {"name": "commands", "description": "List all slash commands."},
+    {"name": "status", "description": "Show current status."},
+    {"name": "whoami", "description": "Show your sender id."},
+    {"name": "model", "description": "Show or set the model."},
+    {"name": "reset", "description": "Reset the current session."},
+    {"name": "new", "description": "Start a new session."},
+    {"name": "think", "description": "Set thinking level."},
+    {"name": "verbose", "description": "Toggle verbose mode."},
+    {"name": "reasoning", "description": "Toggle reasoning visibility."},
+    {"name": "usage", "description": "Usage footer or cost summary."},
+    {"name": "stop", "description": "Stop the current run."},
+]
 
 
 class MaxAdapter(BasePlatformAdapter):
@@ -45,7 +59,7 @@ class MaxAdapter(BasePlatformAdapter):
         self._poll_task: Optional[asyncio.Task] = None
         self._last_event_id: int = extra.get("last_event_id", 0)
         self._running = False
-        self._known_message_ids: set = set()  # Dedup
+        self._known_message_events: set = set()  # Dedup by message id + event payload
 
     # ── connection ──────────────────────────────────────────────
 
@@ -79,6 +93,8 @@ class MaxAdapter(BasePlatformAdapter):
             await self._session.close()
             self._session = None
             return False
+
+        await self._register_native_commands()
 
         self._running = True
         self._poll_task = asyncio.create_task(self._poll_loop())
@@ -118,6 +134,30 @@ class MaxAdapter(BasePlatformAdapter):
             logger.warning(f"Max API POST {path} error: {e}")
         return {}
 
+    async def _api_patch(self, path: str, json_body: dict = None) -> dict:
+        """Helper: PATCH to Max API, return parsed JSON or {}."""
+        if not self._session:
+            return {}
+        try:
+            async with self._session.patch(f"{MAX_API}{path}", json=json_body) as resp:
+                text = await resp.text()
+                if resp.status == 200:
+                    return json.loads(text) if text.strip() else {}
+                logger.warning(f"Max API PATCH {path} → {resp.status}: {text[:300]}")
+        except Exception as e:
+            logger.warning(f"Max API PATCH {path} error: {e}")
+        return {}
+
+    async def _register_native_commands(self) -> None:
+        """Register MAX native command menu entries.
+
+        MAX exposes the slash-command menu from the bot's ``/me.commands`` field,
+        updated with ``PATCH /me``. Keep this list compact: MAX caps it at 32.
+        """
+        result = await self._api_patch("/me", {"commands": MAX_NATIVE_COMMANDS})
+        if result:
+            logger.info("Max: native commands registered (%s)", len(MAX_NATIVE_COMMANDS))
+
     async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
         if not self._session:
             return SendResult(success=False, error="No HTTP session (disconnected)")
@@ -126,10 +166,10 @@ class MaxAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Empty content")
 
         # Handle markdown → Max format (Max supports markdown-like formatting)
-        # Truncate to 4000 chars (Max limit)
-        text = str(content)[:4000]
+        # MAX rejects messages at its hard 4000-char boundary in some cases.
+        text = str(content)[:3900]
 
-        body: Dict[str, Any] = {"text": text}
+        body: Dict[str, Any] = {"text": text, "format": "markdown"}
         if reply_to:
             body["reply_to"] = reply_to
 
@@ -193,8 +233,11 @@ class MaxAdapter(BasePlatformAdapter):
 
         body = {
             "text": caption or "",
+            "format": "markdown" if caption else None,
             "attachments": [{"type": "image", "payload": {"file_id": file_id}}],
         }
+        if body["format"] is None:
+            body.pop("format")
         result = await self._api_post("/messages", params={"chat_id": chat_id}, json_body=body)
         if result:
             return SendResult(success=True, message_id=str(result.get("message_id", "")))
@@ -207,8 +250,11 @@ class MaxAdapter(BasePlatformAdapter):
 
         body = {
             "text": caption or "",
+            "format": "markdown" if caption else None,
             "attachments": [{"type": "file", "payload": {"file_id": file_id}}],
         }
+        if body["format"] is None:
+            body.pop("format")
         result = await self._api_post("/messages", params={"chat_id": chat_id}, json_body=body)
         if result:
             return SendResult(success=True, message_id=str(result.get("message_id", "")))
@@ -234,8 +280,11 @@ class MaxAdapter(BasePlatformAdapter):
 
         body = {
             "text": caption or "",
+            "format": "markdown" if caption else None,
             "attachments": [{"type": "video", "payload": {"file_id": file_id}}],
         }
+        if body["format"] is None:
+            body.pop("format")
         result = await self._api_post("/messages", params={"chat_id": chat_id}, json_body=body)
         if result:
             return SendResult(success=True, message_id=str(result.get("message_id", "")))
@@ -248,8 +297,11 @@ class MaxAdapter(BasePlatformAdapter):
         if url and media_type == "image":
             body = {
                 "text": text,
+                "format": "markdown" if text else None,
                 "attachments": [{"type": "image", "payload": {"url": url}}],
             }
+            if body["format"] is None:
+                body.pop("format")
             result = await self._api_post("/messages", params={"chat_id": chat_id}, json_body=body)
             if result:
                 return SendResult(success=True, message_id=str(result.get("message_id", "")))
@@ -387,14 +439,15 @@ class MaxAdapter(BasePlatformAdapter):
             return
 
         message_id = str(body.get("mid") or msg.get("message_id") or u.get("update_id", ""))
-        if message_id in self._known_message_ids:
-            logger.warning(f"Max: duplicate message_id={message_id}, skipping")
+        dedup_key = (message_id, update_type, text)
+        if dedup_key in self._known_message_events:
+            logger.warning(f"Max: duplicate event message_id={message_id} type={update_type}, skipping")
             return
-        self._known_message_ids.add(message_id)
+        self._known_message_events.add(dedup_key)
 
         # Housekeeping
-        if len(self._known_message_ids) > 10000:
-            self._known_message_ids.clear()
+        if len(self._known_message_events) > 10000:
+            self._known_message_events.clear()
 
         sender = msg.get("sender") or msg.get("author") or msg.get("from") or {}
         author_id = str(sender.get("user_id", ""))
