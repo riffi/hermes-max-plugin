@@ -9,6 +9,7 @@ Base URL: https://platform-api.max.ru
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -66,6 +67,29 @@ MAX_ATTACHMENT_MEDIA_TYPES = {
     "file": "application/octet-stream",
     "document": "application/octet-stream",
 }
+MAX_INBOUND_MEDIA_MAX_BYTES = 50 * 1024 * 1024
+
+
+def _redact_sensitive(value: Any) -> Any:
+    if isinstance(value, dict):
+        redacted: dict[Any, Any] = {}
+        for key, nested in value.items():
+            if str(key).lower() in {"token", "access_token", "authorization"}:
+                redacted[key] = "<redacted>"
+            else:
+                redacted[key] = _redact_sensitive(nested)
+        return redacted
+    if isinstance(value, list):
+        return [_redact_sensitive(item) for item in value]
+    return value
+
+
+def _json_preview(value: Any, limit: int = 4000) -> str:
+    try:
+        text = json.dumps(_redact_sensitive(value), default=str, ensure_ascii=False)
+    except Exception:
+        text = str(value)
+    return text if len(text) <= limit else f"{text[:limit]}...<truncated>"
 
 
 def _max_attachment_type(attachment: Any) -> str:
@@ -128,6 +152,41 @@ def _max_attachment_summary(attachments: list[Any]) -> str:
     return "[MAX attachment: " + ", ".join(parts) + "]"
 
 
+def _max_attachments_from_candidate(candidate: Any) -> list[Any]:
+    if isinstance(candidate, list):
+        return candidate
+    if isinstance(candidate, dict):
+        if "type" in candidate or "payload" in candidate:
+            return [candidate]
+        for key in ("attachments", "attachment"):
+            value = candidate.get(key)
+            if isinstance(value, list):
+                return value
+            if isinstance(value, dict):
+                return [value]
+    return []
+
+
+def _max_extract_attachments(update: dict, message: dict, body: dict) -> tuple[list[Any], str]:
+    """Extract inbound MAX message attachments from known compatible shapes."""
+    candidates = (
+        ("message.body.attachments", body.get("attachments")),
+        ("message.attachments", message.get("attachments")),
+        ("update.attachments", update.get("attachments")),
+        ("message.body.attachment", body.get("attachment")),
+        ("message.attachment", message.get("attachment")),
+        ("update.attachment", update.get("attachment")),
+    )
+    empty_source = ""
+    for source, candidate in candidates:
+        attachments = _max_attachments_from_candidate(candidate)
+        if attachments:
+            return attachments, source
+        if isinstance(candidate, list) and not empty_source:
+            empty_source = source
+    return [], empty_source or "none"
+
+
 class MaxAdapter(BasePlatformAdapter):
     """Long-polling adapter for Max Messenger."""
 
@@ -153,7 +212,6 @@ class MaxAdapter(BasePlatformAdapter):
         self._session = aiohttp.ClientSession(
             headers={
                 "Authorization": self.token,
-                "Content-Type": "application/json",
             },
             timeout=aiohttp.ClientTimeout(total=120),
         )
@@ -289,8 +347,97 @@ class MaxAdapter(BasePlatformAdapter):
         """Mark incoming MAX messages as seen/read."""
         await self._send_chat_action(chat_id, "mark_seen")
 
-    async def _upload_file(self, file_path: str, file_type: str = "file") -> Optional[str]:
-        """Upload a file to Max and return the file_id."""
+    def _inbound_media_cache_dir(self) -> Path:
+        root = Path(os.getenv("HERMES_HOME") or Path.home() / ".hermes")
+        cache_dir = root / "cache" / "max" / "inbound"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        return cache_dir
+
+    @staticmethod
+    def _extension_for_content_type(content_type: str, attachment_type: str) -> str:
+        normalized = (content_type or "").split(";", 1)[0].strip().lower()
+        return {
+            "image/jpeg": ".jpg",
+            "image/png": ".png",
+            "image/gif": ".gif",
+            "image/webp": ".webp",
+            "image/bmp": ".bmp",
+            "video/mp4": ".mp4",
+            "audio/ogg": ".ogg",
+            "audio/mpeg": ".mp3",
+        }.get(normalized, ".jpg" if attachment_type in {"image", "photo"} else ".bin")
+
+    async def _download_inbound_media(
+        self,
+        *,
+        url: str,
+        attachment_type: str,
+        message_id: str,
+        index: int,
+    ) -> tuple[Optional[str], Optional[str]]:
+        if not url.startswith(("http://", "https://")):
+            return None, None
+
+        digest = hashlib.sha256(f"{message_id}:{index}:{url}".encode("utf-8")).hexdigest()[:16]
+        safe_mid = re.sub(r"[^A-Za-z0-9_.-]+", "_", message_id or "message")[:80]
+        try:
+            timeout = aiohttp.ClientTimeout(total=30)
+            # Use a clean session so MAX bot Authorization is never sent to the CDN host.
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(url) as resp:
+                    if resp.status != 200:
+                        logger.warning("Max inbound media download failed: HTTP %s", resp.status)
+                        return None, None
+                    content_type = resp.headers.get("content-type", "")
+                    ext = self._extension_for_content_type(content_type, attachment_type)
+                    path = self._inbound_media_cache_dir() / f"{safe_mid}_{index}_{digest}{ext}"
+
+                    total = 0
+                    with path.open("wb") as f:
+                        async for chunk in resp.content.iter_chunked(64 * 1024):
+                            total += len(chunk)
+                            if total > MAX_INBOUND_MEDIA_MAX_BYTES:
+                                f.close()
+                                try:
+                                    path.unlink(missing_ok=True)
+                                except Exception:
+                                    pass
+                                logger.warning("Max inbound media too large: >%s bytes", MAX_INBOUND_MEDIA_MAX_BYTES)
+                                return None, None
+                            f.write(chunk)
+
+            logger.info("Max: cached inbound %s media: %s", attachment_type, path)
+            return str(path), content_type.split(";", 1)[0].strip().lower() or None
+        except Exception as exc:
+            logger.warning("Max inbound media download error: %s", exc)
+            return None, None
+
+    async def _resolve_inbound_media(self, attachments: list[Any], message_id: str) -> tuple[list[str], list[str]]:
+        media_urls: list[str] = []
+        media_types: list[str] = []
+        for index, attachment in enumerate(attachments):
+            url = _first_http_url(attachment)
+            if not url:
+                continue
+            attachment_type = _max_attachment_type(attachment)
+            fallback_type = MAX_ATTACHMENT_MEDIA_TYPES.get(attachment_type, "application/octet-stream")
+            if attachment_type in {"image", "photo"}:
+                cached_path, downloaded_type = await self._download_inbound_media(
+                    url=url,
+                    attachment_type=attachment_type,
+                    message_id=message_id,
+                    index=index,
+                )
+                if cached_path:
+                    media_urls.append(cached_path)
+                    media_types.append(downloaded_type or fallback_type)
+                    continue
+            media_urls.append(url)
+            media_types.append(fallback_type)
+        return media_urls, media_types
+
+    async def _upload_file(self, file_path: str, file_type: str = "file") -> Optional[dict]:
+        """Upload a file to Max and return the attachment payload."""
         if not self._session:
             return None
 
@@ -298,103 +445,124 @@ class MaxAdapter(BasePlatformAdapter):
         if not path.exists():
             logger.warning(f"Max upload: file not found: {file_path}")
             return None
-
-        content_type_map = {
-            "image": "image/png",
-            "voice": "audio/ogg",
-            "video": "video/mp4",
-            "file": "application/octet-stream",
-        }
-        content_type = content_type_map.get(file_type, "application/octet-stream")
+        upload_type = "audio" if file_type == "voice" else file_type
 
         try:
-            data = aiohttp.FormData()
-            data.add_field("file", path.open("rb"), filename=path.name, content_type=content_type)
-
             headers = {"Authorization": self.token}
             async with self._session.post(
-                f"{MAX_API}/upload", data=data, headers=headers
+                f"{MAX_API}/uploads",
+                params={"type": upload_type},
+                headers=headers,
             ) as resp:
                 if resp.status == 200:
-                    result = await resp.json()
-                    file_id = result.get("file_id")
-                    if file_id:
-                        logger.info(f"Max: uploaded {file_path} → file_id={file_id}")
-                        return file_id
+                    upload_init = await resp.json()
                 else:
                     body = await resp.text()
-                    logger.warning(f"Max upload → {resp.status}: {body[:200]}")
+                    logger.warning(f"Max upload init → {resp.status}: {body[:300]}")
+                    return None
+
+            upload_url = upload_init.get("url")
+            if not upload_url:
+                logger.warning("Max upload init returned no url: %s", upload_init)
+                return None
+
+            data = aiohttp.FormData()
+            with path.open("rb") as f:
+                data.add_field("data", f, filename=path.name)
+                async with self._session.post(upload_url, data=data) as resp:
+                    text = await resp.text()
+                    if resp.status != 200:
+                        logger.warning(f"Max upload data → {resp.status}: {text[:300]}")
+                        return None
+                    upload_result = json.loads(text) if text.strip() else {}
+
+            payload = upload_result if isinstance(upload_result, dict) else {}
+            if not payload.get("token") and upload_init.get("token"):
+                payload["token"] = upload_init["token"]
+            if payload:
+                logger.info("Max: uploaded %s → payload keys=%s", file_path, sorted(payload.keys()))
+                return payload
+            logger.warning("Max upload data returned empty payload for %s", file_path)
         except Exception as e:
             logger.warning(f"Max upload error: {e}")
         return None
 
+    async def _send_attachment_message(
+        self,
+        chat_id,
+        attachment_type: str,
+        payload: dict,
+        caption: Optional[str] = None,
+        *,
+        max_attempts: int = 3,
+    ) -> SendResult:
+        body = {
+            "text": caption or "",
+            "format": "markdown" if caption else None,
+            "attachments": [{"type": attachment_type, "payload": payload}],
+        }
+        if body["format"] is None:
+            body.pop("format")
+
+        for attempt in range(max_attempts):
+            result = await self._api_post("/messages", params={"chat_id": chat_id}, json_body=body)
+            if result:
+                return SendResult(success=True, message_id=str(result.get("message_id", "")))
+            if attempt < max_attempts - 1:
+                await asyncio.sleep(1.0 * (attempt + 1))
+        return SendResult(success=False, error="Max attachment message failed")
+
     async def send_image(self, chat_id, image_url, caption=None) -> SendResult:
         return await self._send_media(chat_id, image_url, "image", caption)
 
-    async def send_image_file(self, chat_id, path, caption=None) -> SendResult:
+    async def send_image_file(
+        self,
+        chat_id,
+        image_path=None,
+        caption=None,
+        reply_to=None,
+        metadata=None,
+        **kwargs,
+    ) -> SendResult:
         """Send image from local file path."""
-        file_id = await self._upload_file(path, "image")
-        if not file_id:
-            return SendResult(success=False)
+        path = image_path or kwargs.get("path")
+        if not path:
+            return SendResult(success=False, error="image_path is required")
 
-        body = {
-            "text": caption or "",
-            "format": "markdown" if caption else None,
-            "attachments": [{"type": "image", "payload": {"file_id": file_id}}],
-        }
-        if body["format"] is None:
-            body.pop("format")
-        result = await self._api_post("/messages", params={"chat_id": chat_id}, json_body=body)
-        if result:
-            return SendResult(success=True, message_id=str(result.get("message_id", "")))
-        return SendResult(success=False)
+        payload = await self._upload_file(path, "image")
+        if not payload:
+            return SendResult(success=False, error="Max image upload failed")
+        return await self._send_attachment_message(chat_id, "image", payload, caption)
 
-    async def send_document(self, chat_id, path, caption=None) -> SendResult:
-        file_id = await self._upload_file(path, "file")
-        if not file_id:
-            return SendResult(success=False)
+    async def send_document(
+        self,
+        chat_id,
+        file_path=None,
+        caption=None,
+        reply_to=None,
+        metadata=None,
+        **kwargs,
+    ) -> SendResult:
+        path = file_path or kwargs.get("path")
+        if not path:
+            return SendResult(success=False, error="file_path is required")
 
-        body = {
-            "text": caption or "",
-            "format": "markdown" if caption else None,
-            "attachments": [{"type": "file", "payload": {"file_id": file_id}}],
-        }
-        if body["format"] is None:
-            body.pop("format")
-        result = await self._api_post("/messages", params={"chat_id": chat_id}, json_body=body)
-        if result:
-            return SendResult(success=True, message_id=str(result.get("message_id", "")))
-        return SendResult(success=False)
+        payload = await self._upload_file(path, "file")
+        if not payload:
+            return SendResult(success=False, error="Max file upload failed")
+        return await self._send_attachment_message(chat_id, "file", payload, caption)
 
     async def send_voice(self, chat_id, path) -> SendResult:
-        file_id = await self._upload_file(path, "voice")
-        if not file_id:
-            return SendResult(success=False)
-
-        body = {
-            "attachments": [{"type": "voice", "payload": {"file_id": file_id}}],
-        }
-        result = await self._api_post("/messages", params={"chat_id": chat_id}, json_body=body)
-        if result:
-            return SendResult(success=True, message_id=str(result.get("message_id", "")))
-        return SendResult(success=False)
+        payload = await self._upload_file(path, "voice")
+        if not payload:
+            return SendResult(success=False, error="Max voice upload failed")
+        return await self._send_attachment_message(chat_id, "audio", payload)
 
     async def send_video(self, chat_id, path, caption=None) -> SendResult:
-        file_id = await self._upload_file(path, "video")
-        if not file_id:
-            return SendResult(success=False)
-
-        body = {
-            "text": caption or "",
-            "format": "markdown" if caption else None,
-            "attachments": [{"type": "video", "payload": {"file_id": file_id}}],
-        }
-        if body["format"] is None:
-            body.pop("format")
-        result = await self._api_post("/messages", params={"chat_id": chat_id}, json_body=body)
-        if result:
-            return SendResult(success=True, message_id=str(result.get("message_id", "")))
-        return SendResult(success=False)
+        payload = await self._upload_file(path, "video")
+        if not payload:
+            return SendResult(success=False, error="Max video upload failed")
+        return await self._send_attachment_message(chat_id, "video", payload, caption)
 
     async def _send_media(self, chat_id, url: str, media_type: str, caption=None) -> SendResult:
         """Send media by URL — Max may not support URL-based images directly."""
@@ -464,16 +632,23 @@ class MaxAdapter(BasePlatformAdapter):
                     backoff = 1
                     updates = body.get("updates", [])
                     
-                    # DEBUG
-                    logger.warning(f"Max poll: marker={marker} new_marker={body.get('marker')} updates_count={len(updates) if isinstance(updates,list) else '?'}")
+                    new_marker = body.get("marker")
+                    updates_count = len(updates) if isinstance(updates, list) else "?"
+                    logger.warning(
+                        "Max poll: marker=%s new_marker=%s updates_count=%s",
+                        marker,
+                        new_marker,
+                        updates_count,
+                    )
+                    if isinstance(updates, list) and not updates and new_marker not in (None, marker):
+                        logger.warning("Max poll: marker advanced with zero returned updates")
                     if updates and isinstance(updates, list) and len(updates) > 0:
-                        logger.warning(f"Max poll: first update sample: {json.dumps(updates[0], default=str)[:500]}")
+                        logger.warning("Max poll: first update sample: %s", _json_preview(updates[0]))
                     
                     if not isinstance(updates, list):
                         logger.warning(f"Max poll: unexpected format: {type(updates)}")
                         continue
 
-                    new_marker = body.get("marker")
                     if new_marker is not None:
                         marker = new_marker
 
@@ -537,16 +712,17 @@ class MaxAdapter(BasePlatformAdapter):
         body = msg.get("body", {}) or {}
         chat_id = str(recipient.get("chat_id", ""))
         text = (body.get("text") or "").strip()
-        attachments_raw = body.get("attachments") or msg.get("attachments") or []
-        if not isinstance(attachments_raw, list):
-            attachments_raw = []
+        attachments_raw, attachments_source = _max_extract_attachments(u, msg, body)
 
         logger.warning(
-            "Max: parsed chat_id=%s text='%s' attachments=%s",
+            "Max: parsed chat_id=%s text='%s' attachments=%s source=%s",
             chat_id,
             text[:50],
             len(attachments_raw),
+            attachments_source,
         )
+        if attachments_raw:
+            logger.warning("Max: attachment preview: %s", _json_preview(attachments_raw))
 
         if not chat_id or (not text and not attachments_raw):
             logger.warning(f"Max: skipping — no chat_id or content")
@@ -580,7 +756,6 @@ class MaxAdapter(BasePlatformAdapter):
             return
 
         await self.mark_seen(chat_id)
-        await self.send_typing(chat_id)
 
         logger.warning(f"Max: building event for user={author_name} chat={chat_id} text='{text[:50]}'")
 
@@ -590,7 +765,7 @@ class MaxAdapter(BasePlatformAdapter):
             user_name=author_name,
         )
 
-        media_urls, media_types = _max_attachment_media(attachments_raw)
+        media_urls, media_types = await self._resolve_inbound_media(attachments_raw, message_id)
         event_text = text
         if attachments_raw:
             summary = _max_attachment_summary(attachments_raw)
@@ -665,7 +840,10 @@ def register(ctx):
             "You are on Max Messenger (max.ru) — российский мессенджер. "
             "Поддерживает markdown: **bold**, *italic*, ~~strikethrough~~, `code`, "
             "[links](url), ## headers. Таблиц нет — используй списки. "
-            "Можно отправлять изображения, файлы, голосовые сообщения. "
+            "Можно отправлять изображения и файлы: чтобы доставить файл пользователю, "
+            "добавь в ответ MEDIA:/absolute/path/to/file. Аудиофайлы (.mp3, .wav, .m4a, .ogg) "
+            "отправляй именно как файлы/document, а не как voice/audio, чтобы Max не пережимал звук. "
+            "Не говори, что отправка файлов недоступна, если файл лежит локально и есть абсолютный путь. "
             "Лимит сообщения: 4000 символов. Общайся на русском."
         ),
     )
