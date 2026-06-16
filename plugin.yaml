@@ -1,0 +1,6 @@
+name: max
+kind: platform
+version: 1.0.0
+description: Max Messenger platform adapter (https://max.ru). Supports long-polling, text, attachments, images, files, voice messages, inline keyboards.
+requires_env:
+  - MAX_BOT_TOKEN
