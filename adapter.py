@@ -38,6 +38,10 @@ DEFAULT_WEBHOOK_PORT = 8650
 DEFAULT_WEBHOOK_PATH = "/max/webhook"
 DEFAULT_UPDATE_TYPES = ["message_created", "message_callback", "bot_started"]
 MAX_WEBHOOK_MAX_BODY_BYTES = 2 * 1024 * 1024
+# MAX documents POST /messages text as "up to 4000 characters". Keep a
+# transport margin because the API has rejected boundary-sized markdown text.
+MAX_MESSAGE_TEXT_LIMIT = 4000
+MAX_MESSAGE_TEXT_CHUNK_SIZE = 3900
 MAX_ATTACHMENT_TYPES = {"image", "file", "voice", "video", "audio", "contact", "inline_keyboard", "clipboard", "location"}
 MAX_NATIVE_COMMANDS = [
     {"name": "help", "description": "Show available commands."},
@@ -192,6 +196,39 @@ def _max_extract_attachments(update: dict, message: dict, body: dict) -> tuple[l
         if isinstance(candidate, list) and not empty_source:
             empty_source = source
     return [], empty_source or "none"
+
+
+def _split_max_text(text: str, limit: int = MAX_MESSAGE_TEXT_CHUNK_SIZE) -> list[str]:
+    """Split outbound text into MAX-sized chunks without silently truncating."""
+    text = str(text or "")
+    if not text:
+        return []
+    if limit <= 0:
+        return [text]
+
+    chunks: list[str] = []
+    remaining = text
+    while len(remaining) > limit:
+        window = remaining[:limit]
+        split_at = -1
+        for separator in ("\n\n", "\n", " "):
+            pos = window.rfind(separator)
+            if pos > 0:
+                split_at = pos + len(separator)
+                break
+        if split_at <= 0:
+            split_at = limit
+
+        chunk = remaining[:split_at]
+        if not chunk:
+            chunk = remaining[:limit]
+            split_at = limit
+        chunks.append(chunk)
+        remaining = remaining[split_at:]
+
+    if remaining:
+        chunks.append(remaining)
+    return chunks
 
 
 class MaxAdapter(BasePlatformAdapter):
@@ -451,17 +488,7 @@ class MaxAdapter(BasePlatformAdapter):
         if result:
             logger.info("Max: native commands registered (%s)", len(MAX_NATIVE_COMMANDS))
 
-    async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
-        if not self._session:
-            return SendResult(success=False, error="No HTTP session (disconnected)")
-
-        if not content:
-            return SendResult(success=False, error="Empty content")
-
-        # Handle markdown → Max format (Max supports markdown-like formatting)
-        # MAX rejects messages at its hard 4000-char boundary in some cases.
-        text = str(content)[:3900]
-
+    async def _send_text_message(self, chat_id, text: str, *, reply_to=None) -> SendResult:
         body: Dict[str, Any] = {"text": text, "format": "markdown"}
         if reply_to:
             body["reply_to"] = reply_to
@@ -471,6 +498,43 @@ class MaxAdapter(BasePlatformAdapter):
             msg_id = str(result.get("message_id") or result.get("message", {}).get("body", {}).get("mid", ""))
             return SendResult(success=True, message_id=msg_id)
         return SendResult(success=False, error="API returned empty response")
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
+        if not self._session:
+            return SendResult(success=False, error="No HTTP session (disconnected)")
+
+        if not content:
+            return SendResult(success=False, error="Empty content")
+
+        chunks = _split_max_text(str(content))
+        if len(chunks) > 1:
+            logger.info(
+                "Max: splitting outbound text into %d chunks (chars=%d, chunk_limit=%d)",
+                len(chunks),
+                len(str(content)),
+                MAX_MESSAGE_TEXT_CHUNK_SIZE,
+            )
+
+        message_ids: list[str] = []
+        for index, chunk in enumerate(chunks):
+            result = await self._send_text_message(
+                chat_id,
+                chunk,
+                reply_to=reply_to if index == 0 else None,
+            )
+            if not result.success:
+                return SendResult(
+                    success=False,
+                    error=f"Max text chunk {index + 1}/{len(chunks)} failed: {result.error}",
+                    message_id=message_ids[-1] if message_ids else "",
+                    continuation_message_ids=tuple(message_ids[:-1]),
+                )
+            message_ids.append(result.message_id or "")
+        return SendResult(
+            success=True,
+            message_id=message_ids[-1] if message_ids else "",
+            continuation_message_ids=tuple(message_ids[:-1]),
+        )
 
     async def _send_chat_action(self, chat_id, action: str, *, debounce_seconds: float = 0.0) -> bool:
         """Send a MAX chat action such as typing_on or mark_seen."""
@@ -649,9 +713,11 @@ class MaxAdapter(BasePlatformAdapter):
         *,
         max_attempts: int = 3,
     ) -> SendResult:
+        caption_chunks = _split_max_text(caption or "")
+        first_caption = caption_chunks[0] if caption_chunks else ""
         body = {
-            "text": caption or "",
-            "format": "markdown" if caption else None,
+            "text": first_caption,
+            "format": "markdown" if first_caption else None,
             "attachments": [{"type": attachment_type, "payload": payload}],
         }
         if body["format"] is None:
@@ -660,7 +726,22 @@ class MaxAdapter(BasePlatformAdapter):
         for attempt in range(max_attempts):
             result = await self._api_post("/messages", params={"chat_id": chat_id}, json_body=body)
             if result:
-                return SendResult(success=True, message_id=str(result.get("message_id", "")))
+                message_ids = [str(result.get("message_id", ""))]
+                for index, chunk in enumerate(caption_chunks[1:], start=2):
+                    text_result = await self._send_text_message(chat_id, chunk)
+                    if not text_result.success:
+                        return SendResult(
+                            success=False,
+                            error=f"Max caption chunk {index}/{len(caption_chunks)} failed: {text_result.error}",
+                            message_id=message_ids[-1] if message_ids else "",
+                            continuation_message_ids=tuple(message_ids[:-1]),
+                        )
+                    message_ids.append(text_result.message_id or "")
+                return SendResult(
+                    success=True,
+                    message_id=message_ids[-1] if message_ids else "",
+                    continuation_message_ids=tuple(message_ids[:-1]),
+                )
             if attempt < max_attempts - 1:
                 await asyncio.sleep(1.0 * (attempt + 1))
         return SendResult(success=False, error="Max attachment message failed")
