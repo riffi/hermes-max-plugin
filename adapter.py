@@ -60,6 +60,7 @@ class MaxAdapter(BasePlatformAdapter):
         self._last_event_id: int = extra.get("last_event_id", 0)
         self._running = False
         self._known_message_events: set = set()  # Dedup by message id + event payload
+        self._last_chat_action_at: Dict[tuple[str, str], float] = {}
 
     # ── connection ──────────────────────────────────────────────
 
@@ -179,9 +180,33 @@ class MaxAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=msg_id)
         return SendResult(success=False, error="API returned empty response")
 
-    async def send_typing(self, chat_id) -> None:
-        """Max doesn't have a dedicated typing endpoint — skip."""
-        pass
+    async def _send_chat_action(self, chat_id, action: str, *, debounce_seconds: float = 0.0) -> bool:
+        """Send a MAX chat action such as typing_on or mark_seen."""
+        chat_id_str = str(chat_id or "").strip()
+        if not chat_id_str:
+            return False
+
+        if debounce_seconds > 0:
+            key = (chat_id_str, action)
+            now = time.monotonic()
+            last = self._last_chat_action_at.get(key, 0.0)
+            if now - last < debounce_seconds:
+                return True
+            self._last_chat_action_at[key] = now
+
+        result = await self._api_post(
+            f"/chats/{chat_id_str}/actions",
+            json_body={"action": action},
+        )
+        return bool(result)
+
+    async def send_typing(self, chat_id, metadata=None) -> None:
+        """Show the MAX typing status while Hermes is processing a turn."""
+        await self._send_chat_action(chat_id, "typing_on", debounce_seconds=3.0)
+
+    async def mark_seen(self, chat_id) -> None:
+        """Mark incoming MAX messages as seen/read."""
+        await self._send_chat_action(chat_id, "mark_seen")
 
     async def _upload_file(self, file_path: str, file_type: str = "file") -> Optional[str]:
         """Upload a file to Max and return the file_id."""
@@ -457,6 +482,8 @@ class MaxAdapter(BasePlatformAdapter):
         if author_id == "282300124":
             logger.warning(f"Max: skipping own message")
             return
+
+        await self.mark_seen(chat_id)
 
         logger.warning(f"Max: building event for user={author_name} chat={chat_id} text='{text[:50]}'")
 
