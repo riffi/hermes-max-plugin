@@ -1,8 +1,8 @@
 """
 Max Messenger platform adapter for Hermes Gateway.
 
-Uses long-polling (GET /updates) for receiving messages and
-REST API (POST /messages) for sending.
+Uses Webhook (POST /subscriptions) or long-polling (GET /updates) for
+receiving messages and REST API (POST /messages) for sending.
 
 API docs: https://dev.max.ru/docs-api
 Base URL: https://platform-api.max.ru
@@ -10,6 +10,7 @@ Base URL: https://platform-api.max.ru
 
 import asyncio
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -19,6 +20,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 import aiohttp
+from aiohttp import web
 
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -31,6 +33,11 @@ from gateway.config import Platform, PlatformConfig
 logger = logging.getLogger(__name__)
 
 MAX_API = "https://platform-api.max.ru"
+DEFAULT_WEBHOOK_HOST = "0.0.0.0"
+DEFAULT_WEBHOOK_PORT = 8650
+DEFAULT_WEBHOOK_PATH = "/max/webhook"
+DEFAULT_UPDATE_TYPES = ["message_created", "message_callback", "bot_started"]
+MAX_WEBHOOK_MAX_BODY_BYTES = 2 * 1024 * 1024
 MAX_ATTACHMENT_TYPES = {"image", "file", "voice", "video", "audio", "contact", "inline_keyboard", "clipboard", "location"}
 MAX_NATIVE_COMMANDS = [
     {"name": "help", "description": "Show available commands."},
@@ -188,7 +195,7 @@ def _max_extract_attachments(update: dict, message: dict, body: dict) -> tuple[l
 
 
 class MaxAdapter(BasePlatformAdapter):
-    """Long-polling adapter for Max Messenger."""
+    """MAX Messenger adapter supporting webhook and long-polling transports."""
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform("max"))
@@ -201,6 +208,49 @@ class MaxAdapter(BasePlatformAdapter):
         self._running = False
         self._known_message_events: set = set()  # Dedup by message id + event payload
         self._last_chat_action_at: Dict[tuple[str, str], float] = {}
+        configured_transport = (
+            os.getenv("MAX_TRANSPORT")
+            or os.getenv("MAX_MODE")
+            or extra.get("transport")
+            or extra.get("mode")
+            or ""
+        )
+        self._webhook_url = str(
+            os.getenv("MAX_WEBHOOK_URL") or extra.get("webhook_url") or ""
+        ).strip()
+        self._transport = str(configured_transport or ("webhook" if self._webhook_url else "polling")).strip().lower()
+        self._webhook_secret = str(
+            os.getenv("MAX_WEBHOOK_SECRET") or extra.get("webhook_secret") or extra.get("secret") or ""
+        ).strip()
+        self._webhook_host = str(
+            os.getenv("MAX_WEBHOOK_HOST") or extra.get("webhook_host") or DEFAULT_WEBHOOK_HOST
+        ).strip()
+        self._webhook_port = int(
+            os.getenv("MAX_WEBHOOK_PORT") or extra.get("webhook_port") or DEFAULT_WEBHOOK_PORT
+        )
+        self._webhook_path = self._normalize_path(
+            os.getenv("MAX_WEBHOOK_PATH") or extra.get("webhook_path") or DEFAULT_WEBHOOK_PATH
+        )
+        self._webhook_update_types = self._parse_update_types(
+            os.getenv("MAX_UPDATE_TYPES") or extra.get("update_types") or DEFAULT_UPDATE_TYPES
+        )
+        self._webhook_runner: Optional[web.AppRunner] = None
+        self._webhook_tasks: set[asyncio.Task] = set()
+
+    @staticmethod
+    def _normalize_path(value: Any) -> str:
+        path = str(value or DEFAULT_WEBHOOK_PATH).strip() or DEFAULT_WEBHOOK_PATH
+        return path if path.startswith("/") else f"/{path}"
+
+    @staticmethod
+    def _parse_update_types(value: Any) -> list[str]:
+        if isinstance(value, str):
+            items = [item.strip() for item in value.split(",")]
+        elif isinstance(value, (list, tuple, set)):
+            items = [str(item).strip() for item in value]
+        else:
+            items = []
+        return [item for item in items if item] or list(DEFAULT_UPDATE_TYPES)
 
     # ── connection ──────────────────────────────────────────────
 
@@ -216,18 +266,18 @@ class MaxAdapter(BasePlatformAdapter):
             timeout=aiohttp.ClientTimeout(total=120),
         )
 
-        # Verify token by polling (no dedicated /me endpoint)
+        # Verify token without consuming updates. MAX requires Authorization header.
         try:
             async with self._session.get(
-                f"{MAX_API}/updates", params={"limit": 1, "timeout": 5}
+                f"{MAX_API}/me", timeout=aiohttp.ClientTimeout(total=15)
             ) as resp:
                 if resp.status != 200:
-                    logger.error(f"Max: /updates returned {resp.status}")
+                    logger.error(f"Max: /me returned {resp.status}")
                     await self._session.close()
                     self._session = None
                     return False
                 data = await resp.json()
-                logger.info(f"Max: connected OK (marker={data.get('marker', '?')})")
+                logger.info("Max: connected OK as %s", data.get("username") or data.get("name") or data.get("user_id") or "?")
         except Exception as e:
             logger.error(f"Max: token check failed: {e}")
             await self._session.close()
@@ -237,7 +287,21 @@ class MaxAdapter(BasePlatformAdapter):
         await self._register_native_commands()
 
         self._running = True
-        self._poll_task = asyncio.create_task(self._poll_loop())
+        if self._transport == "webhook":
+            if not self._webhook_url:
+                logger.error("Max: webhook transport requires MAX_WEBHOOK_URL")
+                await self.disconnect()
+                return False
+            if not self._webhook_url.startswith("https://"):
+                logger.error("Max: MAX_WEBHOOK_URL must start with https://")
+                await self.disconnect()
+                return False
+            await self._start_webhook_server()
+            if not await self._subscribe_webhook():
+                await self.disconnect()
+                return False
+        else:
+            self._poll_task = asyncio.create_task(self._poll_loop())
         self._mark_connected()
         return True
 
@@ -250,10 +314,99 @@ class MaxAdapter(BasePlatformAdapter):
             except asyncio.CancelledError:
                 pass
             self._poll_task = None
+        for task in list(self._webhook_tasks):
+            task.cancel()
+        if self._webhook_tasks:
+            await asyncio.gather(*self._webhook_tasks, return_exceptions=True)
+            self._webhook_tasks.clear()
+        if self._webhook_runner:
+            try:
+                await self._webhook_runner.cleanup()
+            except Exception:
+                logger.exception("Max webhook server cleanup failed")
+            self._webhook_runner = None
         if self._session:
             await self._session.close()
             self._session = None
         self._mark_disconnected()
+
+    async def _start_webhook_server(self) -> None:
+        app = web.Application(client_max_size=MAX_WEBHOOK_MAX_BODY_BYTES)
+        app.router.add_get(self._webhook_path, self._handle_webhook_health)
+        app.router.add_post(self._webhook_path, self._handle_webhook_request)
+        self._webhook_runner = web.AppRunner(app)
+        await self._webhook_runner.setup()
+        site = web.TCPSite(self._webhook_runner, self._webhook_host, self._webhook_port)
+        await site.start()
+        logger.info(
+            "Max webhook listening on %s:%d%s for %s",
+            self._webhook_host,
+            self._webhook_port,
+            self._webhook_path,
+            self._webhook_url,
+        )
+        if not self._webhook_secret:
+            logger.warning("Max webhook secret is not set; MAX recommends X-Max-Bot-Api-Secret validation")
+
+    async def _subscribe_webhook(self) -> bool:
+        body: dict[str, Any] = {
+            "url": self._webhook_url,
+            "update_types": self._webhook_update_types,
+        }
+        if self._webhook_secret:
+            body["secret"] = self._webhook_secret
+
+        result = await self._api_post("/subscriptions", json_body=body)
+        if result.get("success") is True:
+            logger.info("Max webhook subscribed: url=%s types=%s", self._webhook_url, self._webhook_update_types)
+            return True
+        if result:
+            logger.error("Max webhook subscription failed: %s", _json_preview(result))
+        return False
+
+    async def _handle_webhook_health(self, request: "web.Request") -> "web.Response":
+        return web.json_response({"status": "ok", "platform": "max"})
+
+    async def _handle_webhook_request(self, request: "web.Request") -> "web.Response":
+        if self._webhook_secret:
+            provided = request.headers.get("X-Max-Bot-Api-Secret", "")
+            if not hmac.compare_digest(provided, self._webhook_secret):
+                logger.warning("Max webhook rejected: invalid X-Max-Bot-Api-Secret")
+                return web.Response(status=401)
+
+        try:
+            raw = await request.read()
+        except Exception:
+            return web.Response(status=400)
+        if len(raw) > MAX_WEBHOOK_MAX_BODY_BYTES:
+            return web.Response(status=413)
+
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            logger.warning("Max webhook rejected: invalid JSON body")
+            return web.Response(status=400)
+        if not isinstance(payload, dict):
+            return web.Response(status=400)
+
+        task = asyncio.create_task(self._dispatch_webhook_payload(payload))
+        self._webhook_tasks.add(task)
+        task.add_done_callback(self._webhook_tasks.discard)
+        return web.Response(status=200)
+
+    async def _dispatch_webhook_payload(self, payload: dict) -> None:
+        try:
+            updates = payload.get("updates")
+            if isinstance(updates, list):
+                for update in updates:
+                    if isinstance(update, dict):
+                        await self._handle_update(update)
+                return
+            await self._handle_update(payload)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Max webhook dispatch failed: %s", _json_preview(payload, limit=1200))
 
     # ── message sending ─────────────────────────────────────────
 
@@ -801,7 +954,20 @@ def validate_config(config: PlatformConfig) -> bool:
     """Validate that we have a token."""
     extra = getattr(config, "extra", {}) or {}
     token = os.getenv("MAX_BOT_TOKEN") or getattr(config, "token", None) or extra.get("token", "")
-    return bool(token)
+    if not token:
+        return False
+
+    transport = str(
+        os.getenv("MAX_TRANSPORT")
+        or os.getenv("MAX_MODE")
+        or extra.get("transport")
+        or extra.get("mode")
+        or ""
+    ).strip().lower()
+    webhook_url = str(os.getenv("MAX_WEBHOOK_URL") or extra.get("webhook_url") or "").strip()
+    if transport == "webhook" or webhook_url:
+        return webhook_url.startswith("https://")
+    return True
 
 
 def _env_enablement() -> dict:
@@ -817,6 +983,32 @@ def _env_enablement() -> dict:
             "name": os.getenv("MAX_HOME_CHANNEL_NAME", "Home"),
             "thread_id": os.getenv("MAX_HOME_CHANNEL_THREAD_ID", "").strip() or None,
         }
+    transport = os.getenv("MAX_TRANSPORT", "").strip()
+    webhook_url = os.getenv("MAX_WEBHOOK_URL", "").strip()
+    if transport:
+        data["transport"] = transport
+    elif webhook_url:
+        data["transport"] = "webhook"
+    if webhook_url:
+        data["webhook_url"] = webhook_url
+    webhook_secret = os.getenv("MAX_WEBHOOK_SECRET", "").strip()
+    if webhook_secret:
+        data["webhook_secret"] = webhook_secret
+    webhook_host = os.getenv("MAX_WEBHOOK_HOST", "").strip()
+    if webhook_host:
+        data["webhook_host"] = webhook_host
+    webhook_port = os.getenv("MAX_WEBHOOK_PORT", "").strip()
+    if webhook_port:
+        try:
+            data["webhook_port"] = int(webhook_port)
+        except ValueError:
+            data["webhook_port"] = webhook_port
+    webhook_path = os.getenv("MAX_WEBHOOK_PATH", "").strip()
+    if webhook_path:
+        data["webhook_path"] = webhook_path
+    update_types = os.getenv("MAX_UPDATE_TYPES", "").strip()
+    if update_types:
+        data["update_types"] = [item.strip() for item in update_types.split(",") if item.strip()]
     return data
 
 

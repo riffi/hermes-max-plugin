@@ -1,6 +1,47 @@
 name: max
 kind: platform
 version: 1.0.0
-description: Max Messenger platform adapter (https://max.ru). Supports long-polling, text, attachments, images, files, voice messages, inline keyboards.
+description: Max Messenger platform adapter (https://max.ru). Supports webhook or long-polling inbound, text, attachments, images, files, voice messages, inline keyboards.
 requires_env:
   - MAX_BOT_TOKEN
+optional_env:
+  - name: MAX_TRANSPORT
+    description: "Inbound transport: webhook or polling. Defaults to webhook when MAX_WEBHOOK_URL is set, otherwise polling."
+    prompt: "MAX transport"
+    password: false
+  - name: MAX_WEBHOOK_URL
+    description: "Public HTTPS webhook URL registered with MAX, e.g. https://riffi.fvds.ru/max/webhook. MAX requires port 443 externally."
+    prompt: "MAX public webhook URL"
+    password: false
+  - name: MAX_WEBHOOK_SECRET
+    description: "Secret sent by MAX in X-Max-Bot-Api-Secret for webhook requests. Allowed by MAX: A-Z, a-z, 0-9, underscore, hyphen; 5-256 chars."
+    prompt: "MAX webhook secret"
+    password: true
+  - name: MAX_WEBHOOK_HOST
+    description: "Local webhook bind host (default: 0.0.0.0). Use a reverse proxy from 443 to this listener."
+    prompt: "MAX webhook bind host"
+    password: false
+  - name: MAX_WEBHOOK_PORT
+    description: "Local webhook listen port (default: 8650). Public MAX endpoint must still be HTTPS on 443."
+    prompt: "MAX webhook port"
+    password: false
+  - name: MAX_WEBHOOK_PATH
+    description: "Local webhook path (default: /max/webhook). Must match the path in MAX_WEBHOOK_URL."
+    prompt: "MAX webhook path"
+    password: false
+  - name: MAX_UPDATE_TYPES
+    description: "Comma-separated MAX update types to subscribe to (default: message_created,message_callback,bot_started)."
+    prompt: "MAX update types"
+    password: false
+  - name: MAX_ALLOWED_USERS
+    description: "Comma-separated MAX user IDs allowed to talk to the bot."
+    prompt: "Allowed MAX users"
+    password: false
+  - name: MAX_ALLOW_ALL_USERS
+    description: "Allow any MAX user to trigger the bot (dev only)."
+    prompt: "Allow all MAX users? (true/false)"
+    password: false
+  - name: MAX_HOME_CHANNEL
+    description: "Default MAX chat ID for cron / notification delivery."
+    prompt: "MAX home channel"
+    password: false
