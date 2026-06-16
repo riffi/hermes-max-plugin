@@ -46,6 +46,87 @@ MAX_NATIVE_COMMANDS = [
     {"name": "stop", "description": "Stop the current run."},
 ]
 
+MAX_ATTACHMENT_MESSAGE_TYPES = {
+    "image": MessageType.PHOTO,
+    "photo": MessageType.PHOTO,
+    "voice": MessageType.VOICE,
+    "audio": MessageType.AUDIO,
+    "video": MessageType.VIDEO,
+    "file": MessageType.DOCUMENT,
+    "document": MessageType.DOCUMENT,
+    "location": MessageType.LOCATION,
+}
+
+MAX_ATTACHMENT_MEDIA_TYPES = {
+    "image": "image/jpeg",
+    "photo": "image/jpeg",
+    "voice": "audio/ogg",
+    "audio": "audio/mpeg",
+    "video": "video/mp4",
+    "file": "application/octet-stream",
+    "document": "application/octet-stream",
+}
+
+
+def _max_attachment_type(attachment: Any) -> str:
+    if not isinstance(attachment, dict):
+        return ""
+    return str(attachment.get("type") or attachment.get("attachment_type") or "").lower()
+
+
+def _max_message_type(text: str, attachments: list[Any]) -> MessageType:
+    if not attachments:
+        return MessageType.TEXT
+    for attachment in attachments:
+        attachment_type = _max_attachment_type(attachment)
+        if attachment_type in MAX_ATTACHMENT_MESSAGE_TYPES:
+            return MAX_ATTACHMENT_MESSAGE_TYPES[attachment_type]
+    return MessageType.TEXT if text else MessageType.DOCUMENT
+
+
+def _first_http_url(value: Any) -> Optional[str]:
+    if isinstance(value, str):
+        return value if value.startswith(("http://", "https://")) else None
+    if isinstance(value, dict):
+        for key in ("url", "file_url", "download_url", "link", "src", "href"):
+            found = _first_http_url(value.get(key))
+            if found:
+                return found
+        for nested in value.values():
+            found = _first_http_url(nested)
+            if found:
+                return found
+    if isinstance(value, list):
+        for item in value:
+            found = _first_http_url(item)
+            if found:
+                return found
+    return None
+
+
+def _max_attachment_media(attachments: list[Any]) -> tuple[list[str], list[str]]:
+    media_urls: list[str] = []
+    media_types: list[str] = []
+    for attachment in attachments:
+        url = _first_http_url(attachment)
+        if not url:
+            continue
+        attachment_type = _max_attachment_type(attachment)
+        media_urls.append(url)
+        media_types.append(MAX_ATTACHMENT_MEDIA_TYPES.get(attachment_type, "application/octet-stream"))
+    return media_urls, media_types
+
+
+def _max_attachment_summary(attachments: list[Any]) -> str:
+    if not attachments:
+        return ""
+    counts: dict[str, int] = {}
+    for attachment in attachments:
+        attachment_type = _max_attachment_type(attachment) or "unknown"
+        counts[attachment_type] = counts.get(attachment_type, 0) + 1
+    parts = [f"{count} {attachment_type}" for attachment_type, count in sorted(counts.items())]
+    return "[MAX attachment: " + ", ".join(parts) + "]"
+
 
 class MaxAdapter(BasePlatformAdapter):
     """Long-polling adapter for Max Messenger."""
@@ -456,15 +537,30 @@ class MaxAdapter(BasePlatformAdapter):
         body = msg.get("body", {}) or {}
         chat_id = str(recipient.get("chat_id", ""))
         text = (body.get("text") or "").strip()
+        attachments_raw = body.get("attachments") or msg.get("attachments") or []
+        if not isinstance(attachments_raw, list):
+            attachments_raw = []
 
-        logger.warning(f"Max: parsed chat_id={chat_id} text='{text[:50]}'")
+        logger.warning(
+            "Max: parsed chat_id=%s text='%s' attachments=%s",
+            chat_id,
+            text[:50],
+            len(attachments_raw),
+        )
 
-        if not chat_id or not text:
-            logger.warning(f"Max: skipping — no chat_id or text")
+        if not chat_id or (not text and not attachments_raw):
+            logger.warning(f"Max: skipping — no chat_id or content")
             return
 
         message_id = str(body.get("mid") or msg.get("message_id") or u.get("update_id", ""))
-        dedup_key = (message_id, update_type, text)
+        attachment_fingerprint = tuple(
+            (
+                _max_attachment_type(attachment),
+                str(attachment.get("payload", ""))[:120] if isinstance(attachment, dict) else str(attachment)[:120],
+            )
+            for attachment in attachments_raw
+        )
+        dedup_key = (message_id, update_type, text, attachment_fingerprint)
         if dedup_key in self._known_message_events:
             logger.warning(f"Max: duplicate event message_id={message_id} type={update_type}, skipping")
             return
@@ -494,14 +590,20 @@ class MaxAdapter(BasePlatformAdapter):
             user_name=author_name,
         )
 
-        attachments_raw = body.get("attachments") or []
-        has_attachments = len(attachments_raw) > 0
+        media_urls, media_types = _max_attachment_media(attachments_raw)
+        event_text = text
+        if attachments_raw:
+            summary = _max_attachment_summary(attachments_raw)
+            event_text = f"{text}\n\n{summary}".strip() if text else summary
 
         event = MessageEvent(
             message_id=message_id,
-            text=text,
+            text=event_text,
             source=source,
-            message_type=MessageType.ATTACHMENT if has_attachments else MessageType.TEXT,
+            raw_message=u,
+            message_type=_max_message_type(text, attachments_raw),
+            media_urls=media_urls,
+            media_types=media_types,
         )
 
         logger.warning(f"Max: calling handle_message with event")
