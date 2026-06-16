@@ -202,7 +202,7 @@ class MaxAdapter(BasePlatformAdapter):
 
     async def send_typing(self, chat_id, metadata=None) -> None:
         """Show the MAX typing status while Hermes is processing a turn."""
-        await self._send_chat_action(chat_id, "typing_on", debounce_seconds=3.0)
+        await self._send_chat_action(chat_id, "typing_on", debounce_seconds=1.5)
 
     async def mark_seen(self, chat_id) -> None:
         """Mark incoming MAX messages as seen/read."""
@@ -484,6 +484,7 @@ class MaxAdapter(BasePlatformAdapter):
             return
 
         await self.mark_seen(chat_id)
+        await self.send_typing(chat_id)
 
         logger.warning(f"Max: building event for user={author_name} chat={chat_id} text='{text[:50]}'")
 
