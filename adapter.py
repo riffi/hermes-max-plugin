@@ -499,6 +499,22 @@ def validate_config(config: PlatformConfig) -> bool:
     return bool(token)
 
 
+def _env_enablement() -> dict:
+    """Seed Max config from environment variables."""
+    data: dict[str, Any] = {}
+    token = os.getenv("MAX_BOT_TOKEN", "").strip()
+    if token:
+        data["token"] = token
+    home = os.getenv("MAX_HOME_CHANNEL", "").strip()
+    if home:
+        data["home_channel"] = {
+            "chat_id": home,
+            "name": os.getenv("MAX_HOME_CHANNEL_NAME", "Home"),
+            "thread_id": os.getenv("MAX_HOME_CHANNEL_THREAD_ID", "").strip() or None,
+        }
+    return data
+
+
 def register(ctx):
     """Register Max Messenger platform adapter."""
     ctx.register_platform(
@@ -507,10 +523,12 @@ def register(ctx):
         adapter_factory=lambda cfg: MaxAdapter(cfg),
         check_fn=check_requirements,
         validate_config=validate_config,
+        env_enablement_fn=_env_enablement,
         required_env=["MAX_BOT_TOKEN"],
         install_hint="pip install aiohttp",
         allowed_users_env="MAX_ALLOWED_USERS",
         allow_all_env="MAX_ALLOW_ALL_USERS",
+        cron_deliver_env_var="MAX_HOME_CHANNEL",
         max_message_length=4000,
         emoji="💎",
         platform_hint=(
