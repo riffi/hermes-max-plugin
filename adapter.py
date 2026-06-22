@@ -751,14 +751,16 @@ class MaxAdapter(BasePlatformAdapter):
         for index, choice in enumerate(choices, start=1):
             lines.append(f"{index}. {choice}")
 
-        buttons = [
-            [
-                {
-                    "text": f"{index + 1}. {_max_button_label(choice)}",
-                    "payload": f"cl:{clarify_id}:{index}",
-                }
-            ]
+        choice_buttons = [
+            {
+                "text": f"{index + 1}. {_max_button_label(choice)}",
+                "payload": f"cl:{clarify_id}:{index}",
+            }
             for index, choice in enumerate(choices)
+        ]
+        buttons = [
+            choice_buttons[index : index + 2]
+            for index in range(0, len(choice_buttons), 2)
         ]
         buttons.append([{"text": "Свой вариант", "payload": f"cl:{clarify_id}:other"}])
 
