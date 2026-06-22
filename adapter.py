@@ -677,6 +677,19 @@ class MaxAdapter(BasePlatformAdapter):
             body["reply_to"] = reply_to
         if attachments:
             body["attachments"] = attachments
+            for attachment in attachments:
+                if _max_attachment_type(attachment) != "inline_keyboard":
+                    continue
+                buttons = (attachment.get("payload") or {}).get("buttons")
+                if isinstance(buttons, list):
+                    logger.info(
+                        "Max: sending inline keyboard rows=%s preview=%s",
+                        [
+                            len(row) if isinstance(row, list) else 1
+                            for row in buttons
+                        ],
+                        _json_preview(buttons, limit=500),
+                    )
 
         result = await self._api_post_message({"chat_id": chat_id}, body)
         if result:
