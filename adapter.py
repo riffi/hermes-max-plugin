@@ -42,7 +42,7 @@ MAX_WEBHOOK_MAX_BODY_BYTES = 2 * 1024 * 1024
 # transport margin because the API has rejected boundary-sized markdown text.
 MAX_MESSAGE_TEXT_LIMIT = 4000
 MAX_MESSAGE_TEXT_CHUNK_SIZE = 3900
-MAX_INLINE_KEYBOARD_COLUMNS = 2
+MAX_INLINE_KEYBOARD_COLUMNS = 1
 MAX_ATTACHMENT_TYPES = {"image", "file", "voice", "video", "audio", "contact", "inline_keyboard", "clipboard", "location"}
 MAX_NATIVE_COMMANDS = [
     {"name": "help", "description": "Show available commands."},
