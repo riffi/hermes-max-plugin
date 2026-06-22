@@ -42,6 +42,7 @@ MAX_WEBHOOK_MAX_BODY_BYTES = 2 * 1024 * 1024
 # transport margin because the API has rejected boundary-sized markdown text.
 MAX_MESSAGE_TEXT_LIMIT = 4000
 MAX_MESSAGE_TEXT_CHUNK_SIZE = 3900
+MAX_INLINE_KEYBOARD_COLUMNS = 2
 MAX_ATTACHMENT_TYPES = {"image", "file", "voice", "video", "audio", "contact", "inline_keyboard", "clipboard", "location"}
 MAX_NATIVE_COMMANDS = [
     {"name": "help", "description": "Show available commands."},
@@ -275,8 +276,10 @@ def _max_inline_keyboard_attachment(buttons: Any) -> Optional[dict[str, Any]]:
     for row in buttons:
         candidates = row if isinstance(row, list) else [row]
         normalized_row = [button for item in candidates if (button := _max_button(item))]
-        if normalized_row:
-            rows.append(normalized_row)
+        for index in range(0, len(normalized_row), MAX_INLINE_KEYBOARD_COLUMNS):
+            chunk = normalized_row[index : index + MAX_INLINE_KEYBOARD_COLUMNS]
+            if chunk:
+                rows.append(chunk)
 
     if not rows:
         return None
