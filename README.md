@@ -127,6 +127,10 @@ files/documents when preserving sound quality matters.
 
 The adapter supports inline keyboards in two ways.
 
+Use inline keyboards when the user needs to choose a short action or open a
+link. Keep them compact, usually 2-4 buttons. Do not add buttons to ordinary
+informational replies.
+
 For ordinary Hermes replies, include a MAX-specific directive in the outgoing
 text. The adapter removes the directive before sending and converts it to a
 native MAX `inline_keyboard` attachment:
