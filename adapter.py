@@ -79,6 +79,14 @@ MAX_ATTACHMENT_MEDIA_TYPES = {
     "document": "application/octet-stream",
 }
 MAX_INBOUND_MEDIA_MAX_BYTES = 50 * 1024 * 1024
+MAX_BUTTONS_COMMENT_RE = re.compile(
+    r"<!--\s*(?:max_buttons|max_inline_keyboard)\s*:\s*(?P<payload>.*?)\s*-->",
+    re.IGNORECASE | re.DOTALL,
+)
+MAX_BUTTONS_FENCE_RE = re.compile(
+    r"(?:^|\n)```(?:max_buttons|max_inline_keyboard)\s*\n(?P<payload>.*?)(?:\n```)",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 def _redact_sensitive(value: Any) -> Any:
@@ -302,6 +310,62 @@ def _max_metadata_attachments(metadata: Any) -> list[dict[str, Any]]:
         attachments.append(keyboard_attachment)
 
     return attachments
+
+
+def _max_buttons_from_directive_payload(payload: str) -> Optional[dict[str, Any]]:
+    """Parse a plugin-local inline keyboard directive into a MAX attachment."""
+    try:
+        value = json.loads(payload)
+    except Exception as exc:
+        logger.warning("Max: ignored invalid inline keyboard directive: %s", exc)
+        return None
+
+    if isinstance(value, dict):
+        if value.get("type") == "inline_keyboard":
+            attachments = _max_attachments_from_candidate(value)
+            for attachment in attachments:
+                if _max_attachment_type(attachment) == "inline_keyboard":
+                    return attachment
+            return None
+        value = value.get("buttons") or value.get("max_buttons") or value.get("inline_keyboard")
+
+    return _max_inline_keyboard_attachment(value)
+
+
+def _max_extract_inline_keyboard_directives(text: str) -> tuple[str, list[dict[str, Any]]]:
+    """Remove MAX inline keyboard directives from text and return attachments.
+
+    This is intentionally plugin-local: Hermes core only sends plain text plus
+    routing metadata, so the MAX adapter owns the MAX-specific UI hint.
+    """
+    lowered = text.lower()
+    if "max_buttons" not in lowered and "max_inline_keyboard" not in lowered:
+        return text, []
+
+    attachments: list[dict[str, Any]] = []
+
+    def replace(match: re.Match) -> str:
+        attachment = _max_buttons_from_directive_payload(match.group("payload").strip())
+        if attachment:
+            attachments.append(attachment)
+        return ""
+
+    text = MAX_BUTTONS_COMMENT_RE.sub(replace, text)
+    text = MAX_BUTTONS_FENCE_RE.sub(replace, text)
+    text = re.sub(
+        r"<!--\s*(?:max_buttons|max_inline_keyboard)\s*:.*$",
+        "",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    text = re.sub(
+        r"(?:^|\n)```(?:max_buttons|max_inline_keyboard)\s*\n.*$",
+        "",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    return text, attachments
 
 
 class MaxAdapter(BasePlatformAdapter):
@@ -619,7 +683,12 @@ class MaxAdapter(BasePlatformAdapter):
         if not content:
             return SendResult(success=False, error="Empty content")
 
+        content, directive_attachments = _max_extract_inline_keyboard_directives(str(content))
         attachments = _max_metadata_attachments(metadata)
+        attachments.extend(directive_attachments)
+        if not content:
+            return SendResult(success=False, error="Empty content")
+
         chunks = _split_max_text(str(content))
         if len(chunks) > 1:
             logger.info(
@@ -1294,6 +1363,10 @@ def register(ctx):
             "Можно отправлять изображения и файлы: чтобы доставить файл пользователю, "
             "добавь в ответ MEDIA:/absolute/path/to/file. Аудиофайлы (.mp3, .wav, .m4a, .ogg) "
             "отправляй именно как файлы/document, а не как voice/audio, чтобы Max не пережимал звук. "
+            "Для inline-кнопок можно добавить в конец ответа скрытый HTML-комментарий "
+            "`<!-- max_buttons: [[{\"text\":\"Текст\",\"payload\":\"callback\"}]] -->` "
+            "или кнопку-ссылку `<!-- max_buttons: [[{\"text\":\"Открыть\",\"url\":\"https://example.com\"}]] -->`; "
+            "этот комментарий будет удален перед отправкой и превратится в кнопки Max. "
             "Не говори, что отправка файлов недоступна, если файл лежит локально и есть абсолютный путь. "
             "Лимит сообщения: 4000 символов. Общайся на русском."
         ),

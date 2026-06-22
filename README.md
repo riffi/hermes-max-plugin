@@ -125,8 +125,28 @@ files/documents when preserving sound quality matters.
 
 ## Inline Keyboards
 
-The adapter accepts MAX-specific metadata for inline keyboards. Supported
-metadata shapes include:
+The adapter supports inline keyboards in two ways.
+
+For ordinary Hermes replies, include a MAX-specific directive in the outgoing
+text. The adapter removes the directive before sending and converts it to a
+native MAX `inline_keyboard` attachment:
+
+```html
+Choose an action:
+<!-- max_buttons: [[{"text":"Continue","payload":"continue"}],[{"text":"Open","url":"https://example.com"}]] -->
+```
+
+For manual testing, the same JSON can be written as a fenced block:
+
+````markdown
+Choose an action:
+```max_buttons
+[[{"text":"Continue","payload":"continue"}]]
+```
+````
+
+Programmatic sends can also pass MAX-specific metadata. Supported metadata
+shapes include:
 
 ```python
 {
