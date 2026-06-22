@@ -89,6 +89,9 @@ MAX_BUTTONS_FENCE_RE = re.compile(
     r"(?:^|\n)```(?:max_buttons|max_inline_keyboard)\s*\n(?P<payload>.*?)(?:\n```)",
     re.IGNORECASE | re.DOTALL,
 )
+MAX_NUMBERED_OPTION_RE = re.compile(
+    r"^\s*(?:[1-9][\.)]|[1-9]\ufe0f?\u20e3)\s+(?P<text>\S.+?)\s*$"
+)
 
 
 def _redact_sensitive(value: Any) -> Any:
@@ -438,6 +441,31 @@ def _max_extract_inline_keyboard_directives(text: str) -> tuple[str, list[dict[s
     )
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
     return text, attachments
+
+
+def _max_auto_keyboard_from_numbered_options(text: str) -> Optional[dict[str, Any]]:
+    """Infer buttons from a trailing numbered choice list when max_buttons is omitted."""
+    lines = str(text or "").splitlines()
+    options: list[str] = []
+    for line in reversed(lines):
+        if not line.strip():
+            if options:
+                break
+            continue
+        match = MAX_NUMBERED_OPTION_RE.match(line)
+        if not match:
+            break
+        options.append(" ".join(match.group("text").split()))
+
+    options.reverse()
+    if len(options) < 2 or len(options) > 6:
+        return None
+
+    buttons = [
+        [{"type": "callback", "text": option, "payload": option}]
+        for option in options
+    ]
+    return _max_inline_keyboard_attachment(buttons)
 
 
 class MaxAdapter(BasePlatformAdapter):
@@ -826,6 +854,11 @@ class MaxAdapter(BasePlatformAdapter):
         content, directive_attachments = _max_extract_inline_keyboard_directives(str(content))
         attachments = _max_metadata_attachments(metadata)
         attachments.extend(directive_attachments)
+        if not attachments:
+            auto_keyboard = _max_auto_keyboard_from_numbered_options(content)
+            if auto_keyboard:
+                logger.info("Max: inferred inline keyboard from trailing numbered options")
+                attachments.append(auto_keyboard)
         if not content:
             return SendResult(success=False, error="Empty content")
 
@@ -1625,6 +1658,8 @@ def register(ctx):
             "`<!-- max_buttons: [[{\"text\":\"Текст\",\"payload\":\"callback\"}]] -->` "
             "или кнопку-ссылку `<!-- max_buttons: [[{\"text\":\"Открыть\",\"url\":\"https://example.com\"}]] -->`; "
             "этот комментарий будет удален перед отправкой и превратится в кнопки Max. "
+            "Если в ответе есть варианты выбора, меню, квестовые действия или список 2-6 действий, "
+            "обязательно добавь max_buttons с этими вариантами; не оставляй выбор только текстом. "
             "Используй inline-кнопки только когда пользователю нужно выбрать короткое действие "
             "или открыть ссылку; обычно 2-4 кнопки достаточно. Не добавляй кнопки к обычным "
             "информационным ответам. "
