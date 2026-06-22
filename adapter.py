@@ -32,7 +32,7 @@ from gateway.config import Platform, PlatformConfig
 
 logger = logging.getLogger(__name__)
 
-MAX_API = "https://platform-api.max.ru"
+DEFAULT_MAX_API_BASE_URL = "https://platform-api.max.ru"
 DEFAULT_WEBHOOK_HOST = "0.0.0.0"
 DEFAULT_WEBHOOK_PORT = 8650
 DEFAULT_WEBHOOK_PATH = "/max/webhook"
@@ -318,6 +318,13 @@ class MaxAdapter(BasePlatformAdapter):
         self._running = False
         self._known_message_events: set = set()  # Dedup by message id + event payload
         self._last_chat_action_at: Dict[tuple[str, str], float] = {}
+        self._api_base_url = str(
+            os.getenv("MAX_API_BASE_URL")
+            or extra.get("api_base_url")
+            or extra.get("base_url")
+            or DEFAULT_MAX_API_BASE_URL
+        ).rstrip("/")
+        self._bot_user_id = ""
         configured_transport = (
             os.getenv("MAX_TRANSPORT")
             or os.getenv("MAX_MODE")
@@ -379,7 +386,7 @@ class MaxAdapter(BasePlatformAdapter):
         # Verify token without consuming updates. MAX requires Authorization header.
         try:
             async with self._session.get(
-                f"{MAX_API}/me", timeout=aiohttp.ClientTimeout(total=15)
+                f"{self._api_base_url}/me", timeout=aiohttp.ClientTimeout(total=15)
             ) as resp:
                 if resp.status != 200:
                     logger.error(f"Max: /me returned {resp.status}")
@@ -387,6 +394,7 @@ class MaxAdapter(BasePlatformAdapter):
                     self._session = None
                     return False
                 data = await resp.json()
+                self._bot_user_id = str(data.get("user_id") or "")
                 logger.info("Max: connected OK as %s", data.get("username") or data.get("name") or data.get("user_id") or "?")
         except Exception as e:
             logger.error(f"Max: token check failed: {e}")
@@ -525,7 +533,7 @@ class MaxAdapter(BasePlatformAdapter):
         if not self._session:
             return {}
         try:
-            async with self._session.post(f"{MAX_API}{path}", params=params, json=json_body) as resp:
+            async with self._session.post(f"{self._api_base_url}{path}", params=params, json=json_body) as resp:
                 if resp.status == 200:
                     text = await resp.text()
                     if text.strip():
@@ -537,12 +545,35 @@ class MaxAdapter(BasePlatformAdapter):
             logger.warning(f"Max API POST {path} error: {e}")
         return {}
 
+    async def _api_post_message(self, params: dict, body: Dict[str, Any]) -> dict:
+        """POST /messages and retry as plain text if MAX rejects markdown."""
+        if not self._session:
+            return {}
+        try:
+            async with self._session.post(
+                f"{self._api_base_url}/messages", params=params, json=body
+            ) as resp:
+                text = await resp.text()
+                if resp.status == 200:
+                    return json.loads(text) if text.strip() else {}
+                logger.warning(f"Max API POST /messages → {resp.status}: {text[:300]}")
+                if resp.status not in (400, 422) or body.get("format") != "markdown":
+                    return {}
+        except Exception as e:
+            logger.warning(f"Max API POST /messages error: {e}")
+            return {}
+
+        fallback = dict(body)
+        fallback.pop("format", None)
+        logger.info("Max: retrying message without markdown formatting")
+        return await self._api_post("/messages", params=params, json_body=fallback)
+
     async def _api_patch(self, path: str, json_body: dict = None) -> dict:
         """Helper: PATCH to Max API, return parsed JSON or {}."""
         if not self._session:
             return {}
         try:
-            async with self._session.patch(f"{MAX_API}{path}", json=json_body) as resp:
+            async with self._session.patch(f"{self._api_base_url}{path}", json=json_body) as resp:
                 text = await resp.text()
                 if resp.status == 200:
                     return json.loads(text) if text.strip() else {}
@@ -575,7 +606,7 @@ class MaxAdapter(BasePlatformAdapter):
         if attachments:
             body["attachments"] = attachments
 
-        result = await self._api_post("/messages", params={"chat_id": chat_id}, json_body=body)
+        result = await self._api_post_message({"chat_id": chat_id}, body)
         if result:
             msg_id = str(result.get("message_id") or result.get("message", {}).get("body", {}).get("mid", ""))
             return SendResult(success=True, message_id=msg_id)
@@ -751,7 +782,7 @@ class MaxAdapter(BasePlatformAdapter):
         try:
             headers = {"Authorization": self.token}
             async with self._session.post(
-                f"{MAX_API}/uploads",
+                f"{self._api_base_url}/uploads",
                 params={"type": upload_type},
                 headers=headers,
             ) as resp:
@@ -830,7 +861,7 @@ class MaxAdapter(BasePlatformAdapter):
         # completion, but processing can lag for larger media.
         delays = (1.0, 2.0, 3.0, 5.0, 8.0)
         for attempt in range(max_attempts):
-            result = await self._api_post("/messages", params={"chat_id": chat_id}, json_body=body)
+            result = await self._api_post_message({"chat_id": chat_id}, body)
             if result:
                 message_ids = [str(result.get("message_id", ""))]
                 for index, chunk in enumerate(caption_chunks[1:], start=2):
@@ -952,7 +983,7 @@ class MaxAdapter(BasePlatformAdapter):
             }
             if body["format"] is None:
                 body.pop("format")
-            result = await self._api_post("/messages", params={"chat_id": chat_id}, json_body=body)
+            result = await self._api_post_message({"chat_id": chat_id}, body)
             if result:
                 return SendResult(success=True, message_id=str(result.get("message_id", "")))
 
@@ -966,7 +997,7 @@ class MaxAdapter(BasePlatformAdapter):
             return {"name": str(chat_id), "type": "dm"}
 
         try:
-            async with self._session.get(f"{MAX_API}/chats/{chat_id}") as resp:
+            async with self._session.get(f"{self._api_base_url}/chats/{chat_id}") as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     chat = data.get("chat", data)
@@ -996,7 +1027,7 @@ class MaxAdapter(BasePlatformAdapter):
                     params["marker"] = marker
 
                 async with self._session.get(
-                    f"{MAX_API}/updates", params=params, timeout=aiohttp.ClientTimeout(total=40)
+                    f"{self._api_base_url}/updates", params=params, timeout=aiohttp.ClientTimeout(total=40)
                 ) as resp:
                     if resp.status != 200:
                         logger.warning(f"Max poll: HTTP {resp.status}")
@@ -1129,7 +1160,7 @@ class MaxAdapter(BasePlatformAdapter):
         author_name = sender.get("first_name") or sender.get("name") or f"user_{author_id}"
 
         # Skip own messages
-        if author_id == "282300124":
+        if self._bot_user_id and author_id == self._bot_user_id:
             logger.warning(f"Max: skipping own message")
             return
 
@@ -1231,6 +1262,9 @@ def _env_enablement() -> dict:
     webhook_path = os.getenv("MAX_WEBHOOK_PATH", "").strip()
     if webhook_path:
         data["webhook_path"] = webhook_path
+    api_base_url = os.getenv("MAX_API_BASE_URL", "").strip()
+    if api_base_url:
+        data["api_base_url"] = api_base_url
     update_types = os.getenv("MAX_UPDATE_TYPES", "").strip()
     if update_types:
         data["update_types"] = [item.strip() for item in update_types.split(",") if item.strip()]

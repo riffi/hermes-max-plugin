@@ -33,6 +33,10 @@ optional_env:
     description: "Comma-separated MAX update types to subscribe to (default: message_created,message_callback,bot_started)."
     prompt: "MAX update types"
     password: false
+  - name: MAX_API_BASE_URL
+    description: "MAX Bot API base URL (default: https://platform-api.max.ru). Useful for tests, proxies, or compatible endpoints."
+    prompt: "MAX API base URL"
+    password: false
   - name: MAX_ALLOWED_USERS
     description: "Comma-separated MAX user IDs allowed to talk to the bot."
     prompt: "Allowed MAX users"
