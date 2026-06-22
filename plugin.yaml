@@ -10,7 +10,7 @@ optional_env:
     prompt: "MAX transport"
     password: false
   - name: MAX_WEBHOOK_URL
-    description: "Public HTTPS webhook URL registered with MAX, e.g. https://riffi.fvds.ru/max/webhook. MAX requires port 443 externally."
+    description: "Public HTTPS webhook URL registered with MAX, e.g. https://example.com/max/webhook. MAX requires port 443 externally."
     prompt: "MAX public webhook URL"
     password: false
   - name: MAX_WEBHOOK_SECRET
