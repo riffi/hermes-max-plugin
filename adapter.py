@@ -231,6 +231,79 @@ def _split_max_text(text: str, limit: int = MAX_MESSAGE_TEXT_CHUNK_SIZE) -> list
     return chunks
 
 
+def _max_button(value: Any) -> Optional[dict[str, Any]]:
+    """Normalize a compact button description into a MAX Button object."""
+    if not isinstance(value, dict):
+        return None
+
+    text = str(value.get("text") or value.get("label") or "").strip()
+    if not text:
+        return None
+
+    if value.get("type") in {"callback", "link", "message", "clipboard", "open_app"}:
+        button = dict(value)
+        button["text"] = text
+        return button
+
+    if "payload" in value or "callback_data" in value or "data" in value:
+        payload = str(value.get("payload") or value.get("callback_data") or value.get("data") or "")
+        if payload:
+            return {"type": "callback", "text": text, "payload": payload}
+
+    if "url" in value:
+        url = str(value.get("url") or "").strip()
+        if url:
+            return {"type": "link", "text": text, "url": url}
+
+    return None
+
+
+def _max_inline_keyboard_attachment(buttons: Any) -> Optional[dict[str, Any]]:
+    """Build an inline_keyboard attachment from row/button metadata."""
+    if not isinstance(buttons, list):
+        return None
+
+    rows: list[list[dict[str, Any]]] = []
+    for row in buttons:
+        candidates = row if isinstance(row, list) else [row]
+        normalized_row = [button for item in candidates if (button := _max_button(item))]
+        if normalized_row:
+            rows.append(normalized_row)
+
+    if not rows:
+        return None
+    return {"type": "inline_keyboard", "payload": {"buttons": rows}}
+
+
+def _max_metadata_attachments(metadata: Any) -> list[dict[str, Any]]:
+    """Extract MAX attachments from send metadata.
+
+    Supported shapes:
+    - {"max_inline_keyboard": [[{"text": "Open", "url": "https://..."}]]}
+    - {"max_inline_keyboard": [[{"text": "Pick", "payload": "resume:<id>"}]]}
+    - {"max_attachments": [{"type": "inline_keyboard", "payload": {...}}]}
+    """
+    if not isinstance(metadata, dict):
+        return []
+
+    attachments: list[dict[str, Any]] = []
+    raw_attachments = metadata.get("max_attachments") or metadata.get("attachments")
+    if isinstance(raw_attachments, list):
+        attachments.extend(item for item in raw_attachments if isinstance(item, dict) and item.get("type"))
+
+    keyboard = (
+        metadata.get("max_inline_keyboard")
+        or metadata.get("inline_keyboard")
+        or metadata.get("max_buttons")
+        or metadata.get("buttons")
+    )
+    keyboard_attachment = _max_inline_keyboard_attachment(keyboard)
+    if keyboard_attachment:
+        attachments.append(keyboard_attachment)
+
+    return attachments
+
+
 class MaxAdapter(BasePlatformAdapter):
     """MAX Messenger adapter supporting webhook and long-polling transports."""
 
@@ -488,10 +561,19 @@ class MaxAdapter(BasePlatformAdapter):
         if result:
             logger.info("Max: native commands registered (%s)", len(MAX_NATIVE_COMMANDS))
 
-    async def _send_text_message(self, chat_id, text: str, *, reply_to=None) -> SendResult:
+    async def _send_text_message(
+        self,
+        chat_id,
+        text: str,
+        *,
+        reply_to=None,
+        attachments: Optional[list[dict[str, Any]]] = None,
+    ) -> SendResult:
         body: Dict[str, Any] = {"text": text, "format": "markdown"}
         if reply_to:
             body["reply_to"] = reply_to
+        if attachments:
+            body["attachments"] = attachments
 
         result = await self._api_post("/messages", params={"chat_id": chat_id}, json_body=body)
         if result:
@@ -506,6 +588,7 @@ class MaxAdapter(BasePlatformAdapter):
         if not content:
             return SendResult(success=False, error="Empty content")
 
+        attachments = _max_metadata_attachments(metadata)
         chunks = _split_max_text(str(content))
         if len(chunks) > 1:
             logger.info(
@@ -521,6 +604,7 @@ class MaxAdapter(BasePlatformAdapter):
                 chat_id,
                 chunk,
                 reply_to=reply_to if index == 0 else None,
+                attachments=attachments if index == 0 else None,
             )
             if not result.success:
                 return SendResult(
@@ -691,7 +775,23 @@ class MaxAdapter(BasePlatformAdapter):
                     if resp.status != 200:
                         logger.warning(f"Max upload data → {resp.status}: {text[:300]}")
                         return None
-                    upload_result = json.loads(text) if text.strip() else {}
+                    upload_text = text.strip()
+                    if upload_text:
+                        try:
+                            upload_result = json.loads(upload_text)
+                        except json.JSONDecodeError:
+                            # MAX video/audio uploads can return a small XML-ish
+                            # body such as ``<retval>1</retval>``. The usable
+                            # attachment token for those types is returned by
+                            # POST /uploads, not by the upload-host response.
+                            upload_result = {}
+                    else:
+                        upload_result = {}
+
+            if upload_type in {"video", "audio"} and upload_init.get("token"):
+                payload = {"token": upload_init["token"]}
+                logger.info("Max: uploaded %s → payload keys=%s", file_path, sorted(payload.keys()))
+                return payload
 
             payload = upload_result if isinstance(upload_result, dict) else {}
             if not payload.get("token") and upload_init.get("token"):
@@ -711,7 +811,7 @@ class MaxAdapter(BasePlatformAdapter):
         payload: dict,
         caption: Optional[str] = None,
         *,
-        max_attempts: int = 3,
+        max_attempts: int = 6,
     ) -> SendResult:
         caption_chunks = _split_max_text(caption or "")
         first_caption = caption_chunks[0] if caption_chunks else ""
@@ -723,6 +823,12 @@ class MaxAdapter(BasePlatformAdapter):
         if body["format"] is None:
             body.pop("format")
 
+        # MAX can accept the upload and still reject immediate /messages with
+        # attachment.not.ready while the media backend finishes processing the
+        # returned token. Retry with a small backoff; this matches the public
+        # upload flow where video/audio tokens are sent only after upload
+        # completion, but processing can lag for larger media.
+        delays = (1.0, 2.0, 3.0, 5.0, 8.0)
         for attempt in range(max_attempts):
             result = await self._api_post("/messages", params={"chat_id": chat_id}, json_body=body)
             if result:
@@ -743,7 +849,7 @@ class MaxAdapter(BasePlatformAdapter):
                     continuation_message_ids=tuple(message_ids[:-1]),
                 )
             if attempt < max_attempts - 1:
-                await asyncio.sleep(1.0 * (attempt + 1))
+                await asyncio.sleep(delays[min(attempt, len(delays) - 1)])
         return SendResult(success=False, error="Max attachment message failed")
 
     async def send_image(self, chat_id, image_url, caption=None) -> SendResult:
@@ -786,14 +892,50 @@ class MaxAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Max file upload failed")
         return await self._send_attachment_message(chat_id, "file", payload, caption)
 
-    async def send_voice(self, chat_id, path) -> SendResult:
-        payload = await self._upload_file(path, "voice")
+    async def send_voice(
+        self,
+        chat_id,
+        path=None,
+        caption=None,
+        reply_to=None,
+        metadata=None,
+        **kwargs,
+    ) -> SendResult:
+        """Send audio/voice from a local path.
+
+        Hermes' generic gateway routes audio-like media with ``audio_path=...``;
+        older adapter callers used the positional ``path`` argument. Accept both
+        so MAX media delivery works from every gateway path.
+        """
+        audio_path = path or kwargs.get("audio_path") or kwargs.get("voice_path") or kwargs.get("file_path")
+        if not audio_path:
+            return SendResult(success=False, error="audio_path is required")
+
+        payload = await self._upload_file(audio_path, "voice")
         if not payload:
             return SendResult(success=False, error="Max voice upload failed")
-        return await self._send_attachment_message(chat_id, "audio", payload)
+        return await self._send_attachment_message(chat_id, "audio", payload, caption)
 
-    async def send_video(self, chat_id, path, caption=None) -> SendResult:
-        payload = await self._upload_file(path, "video")
+    async def send_video(
+        self,
+        chat_id,
+        path=None,
+        caption=None,
+        reply_to=None,
+        metadata=None,
+        **kwargs,
+    ) -> SendResult:
+        """Send video from a local path.
+
+        Hermes' generic gateway calls platform adapters with ``video_path=...``
+        when it extracts a ``MEDIA:/...mp4`` response. Keep the positional
+        ``path`` form for direct callers, but also accept the generic keyword.
+        """
+        video_path = path or kwargs.get("video_path") or kwargs.get("file_path")
+        if not video_path:
+            return SendResult(success=False, error="video_path is required")
+
+        payload = await self._upload_file(video_path, "video")
         if not payload:
             return SendResult(success=False, error="Max video upload failed")
         return await self._send_attachment_message(chat_id, "video", payload, caption)
@@ -919,12 +1061,14 @@ class MaxAdapter(BasePlatformAdapter):
             payload = callback.get("payload", "")
             msg = u.get("message", {}) or {}
             chat_id = str(msg.get("chat_id") or u.get("chat_id", ""))
-            author = msg.get("author", msg.get("from", {}))
-            author_id = str(author.get("user_id", ""))
+            user = callback.get("user", {}) or u.get("user", {}) or {}
+            author_id = str(user.get("user_id", ""))
+            author_name = user.get("first_name") or user.get("name") or f"user_{author_id}"
 
             source = self.build_source(
                 chat_id=chat_id,
                 user_id=author_id,
+                user_name=author_name,
             )
 
             event = MessageEvent(
