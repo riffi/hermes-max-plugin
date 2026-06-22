@@ -43,6 +43,7 @@ MAX_WEBHOOK_MAX_BODY_BYTES = 2 * 1024 * 1024
 MAX_MESSAGE_TEXT_LIMIT = 4000
 MAX_MESSAGE_TEXT_CHUNK_SIZE = 3900
 MAX_INLINE_KEYBOARD_COLUMNS = 1
+MAX_CALLBACK_NOTIFICATION_LIMIT = 1024
 MAX_ATTACHMENT_TYPES = {"image", "file", "voice", "video", "audio", "contact", "inline_keyboard", "clipboard", "location"}
 MAX_NATIVE_COMMANDS = [
     {"name": "help", "description": "Show available commands."},
@@ -217,12 +218,42 @@ def _max_callback_payload(update: dict, callback: Any) -> str:
     return str(update.get("payload") or update.get("callback_payload") or update.get("data") or "").strip()
 
 
+def _max_callback_id(update: dict, callback: Any) -> str:
+    if isinstance(callback, dict):
+        direct = callback.get("callback_id")
+        if direct:
+            return str(direct).strip()
+        found = _max_find_first_key(callback, {"callback_id"})
+        if found:
+            return found.strip()
+    return str(update.get("callback_id") or "").strip()
+
+
 def _max_callback_text(update: dict, callback: Any) -> str:
     if isinstance(callback, dict):
         found = _max_find_first_key(callback, {"text", "title", "label"})
         if found:
             return found.strip()
     return str(update.get("text") or update.get("title") or update.get("label") or "").strip()
+
+
+def _max_message_text(message: Any) -> str:
+    if not isinstance(message, dict):
+        return ""
+    body = message.get("body")
+    if isinstance(body, dict):
+        text = body.get("text")
+        if text:
+            return str(text)
+    text = message.get("text")
+    return str(text) if text else ""
+
+
+def _max_trim_callback_text(text: str, limit: int = MAX_CALLBACK_NOTIFICATION_LIMIT) -> str:
+    value = " ".join(str(text or "").split())
+    if len(value) <= limit:
+        return value
+    return value[: max(1, limit - 1)].rstrip() + "…"
 
 
 def _max_extract_attachments(update: dict, message: dict, body: dict) -> tuple[list[Any], str]:
@@ -673,6 +704,60 @@ class MaxAdapter(BasePlatformAdapter):
         fallback.pop("format", None)
         logger.info("Max: retrying message without markdown formatting")
         return await self._api_post("/messages", params=params, json_body=fallback)
+
+    async def _answer_callback(
+        self,
+        callback_id: str,
+        *,
+        notification: str = "",
+        message: Optional[dict[str, Any]] = None,
+    ) -> bool:
+        if not callback_id:
+            return False
+
+        body: dict[str, Any] = {}
+        if notification:
+            body["notification"] = _max_trim_callback_text(notification)
+        if message is not None:
+            body["message"] = message
+        if not body:
+            return False
+
+        result = await self._api_post(
+            "/answers",
+            params={"callback_id": callback_id},
+            json_body=body,
+        )
+        return bool(result)
+
+    async def _ack_callback_selection(
+        self,
+        callback_id: str,
+        message: dict[str, Any],
+        selected_text: str,
+    ) -> None:
+        if not callback_id:
+            logger.warning("Max callback ack skipped: missing callback_id")
+            return
+
+        selected = _max_trim_callback_text(selected_text, limit=180)
+        original_text = _max_message_text(message).strip()
+        if original_text:
+            updated_text = f"{original_text}\n\nВы выбрали: {selected}"
+        else:
+            updated_text = f"Вы выбрали: {selected}"
+
+        answer_message: dict[str, Any] = {
+            "text": updated_text,
+            "attachments": [],
+        }
+        ok = await self._answer_callback(
+            callback_id,
+            notification=f"Выбрано: {selected}",
+            message=answer_message,
+        )
+        if not ok:
+            logger.warning("Max callback ack failed (callback_id=%s)", callback_id)
 
     async def _api_patch(self, path: str, json_body: dict = None) -> dict:
         """Helper: PATCH to Max API, return parsed JSON or {}."""
@@ -1263,6 +1348,7 @@ class MaxAdapter(BasePlatformAdapter):
         if update_type == "message_callback":
             callback = u.get("callback", {}) or {}
             payload = _max_callback_payload(u, callback)
+            callback_id = _max_callback_id(u, callback)
             msg = u.get("message", {}) or {}
             recipient = msg.get("recipient", {}) or {}
             chat_id = str(
@@ -1281,6 +1367,11 @@ class MaxAdapter(BasePlatformAdapter):
                     _, clarify_id, choice = parts
                     session_key = self._clarify_state.get(clarify_id)
                     if choice == "other":
+                        await self._ack_callback_selection(
+                            callback_id,
+                            msg,
+                            "Свой вариант",
+                        )
                         try:
                             from tools.clarify_gateway import mark_awaiting_text
 
@@ -1299,6 +1390,12 @@ class MaxAdapter(BasePlatformAdapter):
                             resolved_text = str(entry.choices[int(choice)])
                     except Exception:
                         resolved_text = choice
+
+                    await self._ack_callback_selection(
+                        callback_id,
+                        msg,
+                        resolved_text,
+                    )
 
                     try:
                         from tools.clarify_gateway import resolve_gateway_clarify
@@ -1323,6 +1420,8 @@ class MaxAdapter(BasePlatformAdapter):
             if not callback_text:
                 logger.warning("Max callback ignored: no payload/text in update %s", _json_preview(u, limit=1200))
                 return
+            selected_text = _max_callback_text(u, callback) or callback_text
+            await self._ack_callback_selection(callback_id, msg, selected_text)
 
             source = self.build_source(
                 chat_id=chat_id,
