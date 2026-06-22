@@ -283,13 +283,6 @@ def _max_inline_keyboard_attachment(buttons: Any) -> Optional[dict[str, Any]]:
     return {"type": "inline_keyboard", "payload": {"buttons": rows}}
 
 
-def _max_button_label(value: Any, limit: int = 56) -> str:
-    text = " ".join(str(value or "").split())
-    if len(text) <= limit:
-        return text
-    return text[: max(1, limit - 1)].rstrip() + "…"
-
-
 def _max_metadata_attachments(metadata: Any) -> list[dict[str, Any]]:
     """Extract MAX attachments from send metadata.
 
@@ -766,7 +759,7 @@ class MaxAdapter(BasePlatformAdapter):
 
         choice_buttons = [
             {
-                "text": f"{index + 1}. {_max_button_label(choice)}",
+                "text": str(index + 1),
                 "payload": f"cl:{clarify_id}:{index}",
             }
             for index, choice in enumerate(choices)
