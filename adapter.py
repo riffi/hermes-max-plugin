@@ -283,6 +283,13 @@ def _max_inline_keyboard_attachment(buttons: Any) -> Optional[dict[str, Any]]:
     return {"type": "inline_keyboard", "payload": {"buttons": rows}}
 
 
+def _max_button_label(value: Any, limit: int = 56) -> str:
+    text = " ".join(str(value or "").split())
+    if len(text) <= limit:
+        return text
+    return text[: max(1, limit - 1)].rstrip() + "…"
+
+
 def _max_metadata_attachments(metadata: Any) -> list[dict[str, Any]]:
     """Extract MAX attachments from send metadata.
 
@@ -382,6 +389,7 @@ class MaxAdapter(BasePlatformAdapter):
         self._running = False
         self._known_message_events: set = set()  # Dedup by message id + event payload
         self._last_chat_action_at: Dict[tuple[str, str], float] = {}
+        self._clarify_state: dict[str, str] = {}
         self._api_base_url = str(
             os.getenv("MAX_API_BASE_URL")
             or extra.get("api_base_url")
@@ -719,6 +727,53 @@ class MaxAdapter(BasePlatformAdapter):
             message_id=message_ids[-1] if message_ids else "",
             continuation_message_ids=tuple(message_ids[:-1]),
         )
+
+    async def send_clarify(
+        self,
+        chat_id: str,
+        question: str,
+        choices: Optional[list],
+        clarify_id: str,
+        session_key: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Render Hermes clarify prompts as native MAX inline buttons."""
+        if not choices:
+            try:
+                from tools.clarify_gateway import mark_awaiting_text
+
+                mark_awaiting_text(clarify_id)
+            except Exception:
+                pass
+            return await self.send(chat_id, f"❓ {question}", metadata=metadata)
+
+        lines = [f"❓ {question}", ""]
+        for index, choice in enumerate(choices, start=1):
+            lines.append(f"{index}. {choice}")
+
+        buttons = [
+            [
+                {
+                    "text": f"{index + 1}. {_max_button_label(choice)}",
+                    "payload": f"cl:{clarify_id}:{index}",
+                }
+            ]
+            for index, choice in enumerate(choices)
+        ]
+        buttons.append([{"text": "Свой вариант", "payload": f"cl:{clarify_id}:other"}])
+
+        outgoing_metadata = dict(metadata or {})
+        outgoing_metadata["max_inline_keyboard"] = buttons
+
+        self._clarify_state[clarify_id] = session_key
+        result = await self.send(
+            chat_id,
+            "\n".join(lines),
+            metadata=outgoing_metadata,
+        )
+        if not result.success:
+            self._clarify_state.pop(clarify_id, None)
+        return result
 
     async def _send_chat_action(self, chat_id, action: str, *, debounce_seconds: float = 0.0) -> bool:
         """Send a MAX chat action such as typing_on or mark_seen."""
@@ -1160,10 +1215,60 @@ class MaxAdapter(BasePlatformAdapter):
             callback = u.get("callback", {}) or {}
             payload = callback.get("payload", "")
             msg = u.get("message", {}) or {}
-            chat_id = str(msg.get("chat_id") or u.get("chat_id", ""))
+            recipient = msg.get("recipient", {}) or {}
+            chat_id = str(
+                msg.get("chat_id")
+                or recipient.get("chat_id")
+                or callback.get("chat_id")
+                or u.get("chat_id", "")
+            )
             user = callback.get("user", {}) or u.get("user", {}) or {}
             author_id = str(user.get("user_id", ""))
             author_name = user.get("first_name") or user.get("name") or f"user_{author_id}"
+
+            if isinstance(payload, str) and payload.startswith("cl:"):
+                parts = payload.split(":", 2)
+                if len(parts) == 3:
+                    _, clarify_id, choice = parts
+                    session_key = self._clarify_state.get(clarify_id)
+                    if choice == "other":
+                        try:
+                            from tools.clarify_gateway import mark_awaiting_text
+
+                            mark_awaiting_text(clarify_id)
+                        except Exception as exc:
+                            logger.warning("Max clarify other mark failed: %s", exc)
+                        await self.send(chat_id, "Напиши свой вариант текстом.")
+                        return
+
+                    resolved_text = choice
+                    try:
+                        from tools.clarify_gateway import _entries as _clarify_entries  # type: ignore
+
+                        entry = _clarify_entries.get(clarify_id)
+                        if entry and entry.choices:
+                            resolved_text = str(entry.choices[int(choice)])
+                    except Exception:
+                        resolved_text = choice
+
+                    try:
+                        from tools.clarify_gateway import resolve_gateway_clarify
+
+                        resolved = resolve_gateway_clarify(clarify_id, resolved_text)
+                    except Exception as exc:
+                        logger.warning("Max clarify resolve failed: %s", exc)
+                        resolved = False
+
+                    if resolved:
+                        self._clarify_state.pop(clarify_id, None)
+                        logger.info(
+                            "Max clarify button resolved (id=%s, choice=%r, session=%s)",
+                            clarify_id,
+                            resolved_text,
+                            session_key,
+                        )
+                        return
+                    logger.warning("Max clarify button had no waiter (id=%s)", clarify_id)
 
             source = self.build_source(
                 chat_id=chat_id,
