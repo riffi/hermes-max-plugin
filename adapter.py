@@ -187,6 +187,44 @@ def _max_attachments_from_candidate(candidate: Any) -> list[Any]:
     return []
 
 
+def _max_find_first_key(value: Any, names: set[str]) -> str:
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            if str(key).lower() in names and nested not in (None, ""):
+                return str(nested)
+        for nested in value.values():
+            found = _max_find_first_key(nested, names)
+            if found:
+                return found
+    elif isinstance(value, list):
+        for nested in value:
+            found = _max_find_first_key(nested, names)
+            if found:
+                return found
+    return ""
+
+
+def _max_callback_payload(update: dict, callback: Any) -> str:
+    if isinstance(callback, str):
+        return callback.strip()
+    if isinstance(callback, dict):
+        direct = callback.get("payload") or callback.get("callback_payload") or callback.get("data")
+        if direct:
+            return str(direct).strip()
+        found = _max_find_first_key(callback, {"payload", "callback_payload", "data"})
+        if found:
+            return found.strip()
+    return str(update.get("payload") or update.get("callback_payload") or update.get("data") or "").strip()
+
+
+def _max_callback_text(update: dict, callback: Any) -> str:
+    if isinstance(callback, dict):
+        found = _max_find_first_key(callback, {"text", "title", "label"})
+        if found:
+            return found.strip()
+    return str(update.get("text") or update.get("title") or update.get("label") or "").strip()
+
+
 def _max_extract_attachments(update: dict, message: dict, body: dict) -> tuple[list[Any], str]:
     """Extract inbound MAX message attachments from known compatible shapes."""
     candidates = (
@@ -1224,16 +1262,16 @@ class MaxAdapter(BasePlatformAdapter):
         # Callback (inline button press)
         if update_type == "message_callback":
             callback = u.get("callback", {}) or {}
-            payload = callback.get("payload", "")
+            payload = _max_callback_payload(u, callback)
             msg = u.get("message", {}) or {}
             recipient = msg.get("recipient", {}) or {}
             chat_id = str(
                 msg.get("chat_id")
                 or recipient.get("chat_id")
-                or callback.get("chat_id")
+                or (callback.get("chat_id") if isinstance(callback, dict) else "")
                 or u.get("chat_id", "")
             )
-            user = callback.get("user", {}) or u.get("user", {}) or {}
+            user = (callback.get("user", {}) if isinstance(callback, dict) else {}) or u.get("user", {}) or {}
             author_id = str(user.get("user_id", ""))
             author_name = user.get("first_name") or user.get("name") or f"user_{author_id}"
 
@@ -1281,6 +1319,11 @@ class MaxAdapter(BasePlatformAdapter):
                         return
                     logger.warning("Max clarify button had no waiter (id=%s)", clarify_id)
 
+            callback_text = payload or _max_callback_text(u, callback)
+            if not callback_text:
+                logger.warning("Max callback ignored: no payload/text in update %s", _json_preview(u, limit=1200))
+                return
+
             source = self.build_source(
                 chat_id=chat_id,
                 user_id=author_id,
@@ -1289,7 +1332,7 @@ class MaxAdapter(BasePlatformAdapter):
 
             event = MessageEvent(
                 message_id=str(u.get("update_id", u.get("event_id", ""))),
-                text=f"/callback {payload}",
+                text=callback_text,
                 source=source,
                 message_type=MessageType.TEXT,
             )
