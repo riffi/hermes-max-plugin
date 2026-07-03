@@ -141,8 +141,15 @@ native MAX `inline_keyboard` attachment:
 
 ```html
 Choose an action:
-<!-- max_buttons: [[{"text":"Continue","payload":"continue"}],[{"text":"Open","url":"https://example.com"}]] -->
+<!-- max_buttons: [[{"text":"Continue","payload":"continue"}],[{"text":"Open","url":"https://example.com"}],[{"text":"Copy","copy":"text for clipboard"}]] -->
 ```
+
+Button shorthands:
+
+- `{ "text": "Continue", "payload": "continue" }` → MAX `callback` button
+- `{ "text": "Open", "url": "https://example.com" }` → MAX `link` button
+- `{ "text": "Copy", "copy": "text for clipboard" }` → MAX `clipboard` button
+- raw MAX button objects also pass through, e.g. `{ "type": "clipboard", "text": "Copy", "payload": "text for clipboard" }`
 
 For manual testing, the same JSON can be written as a fenced block:
 

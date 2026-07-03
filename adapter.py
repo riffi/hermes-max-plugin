@@ -64,7 +64,7 @@ MAX_ATTACHMENT_MESSAGE_TYPES = {
     "image": MessageType.PHOTO,
     "photo": MessageType.PHOTO,
     "voice": MessageType.VOICE,
-    "audio": MessageType.AUDIO,
+    "audio": MessageType.VOICE,  # Max API does not distinguish voice from audio; treat all audio as voice for STT
     "video": MessageType.VIDEO,
     "file": MessageType.DOCUMENT,
     "document": MessageType.DOCUMENT,
@@ -321,8 +321,29 @@ def _max_button(value: Any) -> Optional[dict[str, Any]]:
     if not text:
         return None
 
-    if value.get("type") in {"callback", "link", "message", "clipboard", "open_app"}:
+    button_type = str(value.get("type") or "").strip().lower()
+    clipboard_payload = value.get("clipboard") or value.get("copy") or value.get("copy_text") or value.get("clipboard_text")
+
+    if button_type == "clipboard":
+        payload = str(value.get("payload") or clipboard_payload or "")
+        if not payload:
+            return None
         button = dict(value)
+        button["type"] = "clipboard"
+        button["text"] = text
+        button["payload"] = payload
+        for alias in ("clipboard", "copy", "copy_text", "clipboard_text"):
+            button.pop(alias, None)
+        return button
+
+    if clipboard_payload is not None:
+        payload = str(clipboard_payload)
+        if payload:
+            return {"type": "clipboard", "text": text, "payload": payload}
+
+    if button_type in {"callback", "link", "message", "open_app"}:
+        button = dict(value)
+        button["type"] = button_type
         button["text"] = text
         return button
 
@@ -988,7 +1009,10 @@ class MaxAdapter(BasePlatformAdapter):
             "video/mp4": ".mp4",
             "audio/ogg": ".ogg",
             "audio/mpeg": ".mp3",
-        }.get(normalized, ".jpg" if attachment_type in {"image", "photo"} else ".bin")
+        }.get(
+            normalized,
+            ".jpg" if attachment_type in {"image", "photo"} else ".ogg" if attachment_type == "voice" else ".bin",
+        )
 
     async def _download_inbound_media(
         self,
@@ -1044,7 +1068,14 @@ class MaxAdapter(BasePlatformAdapter):
                 continue
             attachment_type = _max_attachment_type(attachment)
             fallback_type = MAX_ATTACHMENT_MEDIA_TYPES.get(attachment_type, "application/octet-stream")
-            if attachment_type in {"image", "photo"}:
+            # Cache media types that downstream Hermes processors need as local
+            # files. Vision can work with local image paths, and the gateway STT
+            # pipeline expects voice/audio messages to be local audio files, not
+            # CDN URLs. Max API does not distinguish voice from audio — both come
+            # as type: "audio". Cache both so STT can transcribe voice messages.
+            # Music files will also be cached, but STT will attempt transcription;
+            # this is acceptable for now.
+            if attachment_type in {"image", "photo", "voice", "audio"}:
                 cached_path, downloaded_type = await self._download_inbound_media(
                     url=url,
                     attachment_type=attachment_type,
@@ -1656,8 +1687,10 @@ def register(ctx):
             "отправляй именно как файлы/document, а не как voice/audio, чтобы Max не пережимал звук. "
             "Для inline-кнопок можно добавить в конец ответа скрытый HTML-комментарий "
             "`<!-- max_buttons: [[{\"text\":\"Текст\",\"payload\":\"callback\"}]] -->` "
-            "или кнопку-ссылку `<!-- max_buttons: [[{\"text\":\"Открыть\",\"url\":\"https://example.com\"}]] -->`; "
-            "этот комментарий будет удален перед отправкой и превратится в кнопки Max. "
+            "или кнопку-ссылку `<!-- max_buttons: [[{\"text\":\"Открыть\",\"url\":\"https://example.com\"}]] -->`, "
+            "или кнопку копирования `<!-- max_buttons: [[{\"text\":\"Copy\",\"copy\":\"текст для буфера\"}]] -->`; "
+            "для нативной MAX clipboard-кнопки также можно использовать `type: \"clipboard\"` и `payload`. "
+            "Этот комментарий будет удален перед отправкой и превратится в кнопки Max. "
             "Если в ответе есть варианты выбора, меню, квестовые действия или список 2-6 действий, "
             "обязательно добавь max_buttons с этими вариантами; не оставляй выбор только текстом. "
             "Используй inline-кнопки только когда пользователю нужно выбрать короткое действие "
