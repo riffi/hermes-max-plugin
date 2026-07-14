@@ -1258,15 +1258,26 @@ class MaxAdapter(BasePlatformAdapter):
         metadata=None,
         **kwargs,
     ) -> SendResult:
-        """Send audio/voice from a local path.
+        """Send audio from a local path without MAX-side recompression.
 
-        Hermes' generic gateway routes audio-like media with ``audio_path=...``;
-        older adapter callers used the positional ``path`` argument. Accept both
-        so MAX media delivery works from every gateway path.
+        Hermes' generic gateway routes every recognized audio extension through
+        ``send_voice(audio_path=...)``.  MAX may transcode native audio/voice
+        attachments, so preserve the original bytes by delivering audio as a
+        regular document by default.  Direct callers can explicitly opt into a
+        native MAX voice attachment with ``metadata={"max_native_voice": True}``.
         """
         audio_path = path or kwargs.get("audio_path") or kwargs.get("voice_path") or kwargs.get("file_path")
         if not audio_path:
             return SendResult(success=False, error="audio_path is required")
+
+        if not bool((metadata or {}).get("max_native_voice")):
+            return await self.send_document(
+                chat_id=chat_id,
+                file_path=audio_path,
+                caption=caption,
+                reply_to=reply_to,
+                metadata=metadata,
+            )
 
         payload = await self._upload_file(audio_path, "voice")
         if not payload:
