@@ -1011,7 +1011,11 @@ class MaxAdapter(BasePlatformAdapter):
             "audio/mpeg": ".mp3",
         }.get(
             normalized,
-            ".jpg" if attachment_type in {"image", "photo"} else ".ogg" if attachment_type == "voice" else ".bin",
+            ".jpg"
+            if attachment_type in {"image", "photo"}
+            else ".ogg"
+            if attachment_type in {"voice", "audio"}
+            else ".bin",
         )
 
     async def _download_inbound_media(
