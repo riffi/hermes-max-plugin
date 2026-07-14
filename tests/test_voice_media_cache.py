@@ -178,3 +178,11 @@ def test_native_voice_delivery_requires_explicit_opt_in():
     assert result.success is True
     assert uploaded == {"path": "/tmp/voice.ogg", "attachment_type": "voice"}
     assert sent["attachment_type"] == "audio"
+
+
+def test_connect_accepts_gateway_reconnect_keyword():
+    module = _load_max_adapter_module()
+    adapter = module.MaxAdapter(PlatformConfig(enabled=True, token="token"))
+    adapter.token = ""
+
+    assert asyncio.run(adapter.connect(is_reconnect=True)) is False

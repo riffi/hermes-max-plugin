@@ -557,7 +557,7 @@ class MaxAdapter(BasePlatformAdapter):
 
     # ── connection ──────────────────────────────────────────────
 
-    async def connect(self) -> bool:
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
         if not self.token:
             logger.error("Max: MAX_BOT_TOKEN not set")
             return False
