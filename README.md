@@ -25,6 +25,13 @@ events, typing/read actions, and cron notification delivery to a default chat.
 - Python package: `aiohttp`.
 - A MAX bot token.
 
+`platform-api2.max.ru`'s TLS cert chains to the Russian Ministry of Digital
+Development's own root CA, which isn't in the standard system/Mozilla trust
+store. The `ca/` directory bundles the official root+sub certs (from
+`gu-st.ru`, the Mintsifry-operated distribution host) and the adapter
+extends (not replaces) the default trust store with them — no extra system
+CA installation needed on the host running Hermes.
+
 Install the runtime dependency in the same environment that runs Hermes:
 
 ```bash
@@ -33,16 +40,33 @@ pip install aiohttp
 
 ## Installation
 
-Place this repository in the Hermes platform plugin directory as `max`:
+This is a third-party (Plugin Path) adapter, not a bundled/core one — per
+Hermes's own `gateway/platforms/ADDING_A_PLATFORM.md`, third-party plugins
+belong directly under `~/.hermes/plugins/<name>/`, **not**
+`~/.hermes/plugins/platforms/<name>/` (that `platforms/` subdirectory is
+reserved for adapters bundled with Hermes itself — the plugin scanner keys
+a user-installed plugin by its directory name one level down from
+`~/.hermes/plugins/`, so installing under `platforms/max` registers a
+platform key of `platforms/max` instead of `max`, and the adapter silently
+never loads).
+
+The simplest correct install is via the Hermes CLI, which handles the path
+for you:
 
 ```bash
-mkdir -p ~/.hermes/plugins/platforms
-git clone <your-repo-url> ~/.hermes/plugins/platforms/max
+hermes plugins install <your-repo-url-or-owner/repo>
+hermes plugins enable max
 ```
 
-Then enable/configure the platform through your Hermes gateway configuration or
-the Hermes plugin management UI, depending on how your Hermes deployment is
-managed.
+Equivalent manual install:
+
+```bash
+git clone <your-repo-url> ~/.hermes/plugins/max
+hermes plugins enable max
+```
+
+Then restart the gateway (`hermes gateway restart`) for it to pick up the
+newly enabled platform.
 
 ## Configuration
 
@@ -66,7 +90,7 @@ Optional:
 | `MAX_WEBHOOK_PORT` | Local webhook listen port. Defaults to `8650`. |
 | `MAX_WEBHOOK_PATH` | Local webhook path. Defaults to `/max/webhook`. |
 | `MAX_UPDATE_TYPES` | Comma-separated update types. Defaults to `message_created,message_callback,bot_started`. |
-| `MAX_API_BASE_URL` | MAX Bot API base URL. Defaults to `https://platform-api.max.ru`; override for tests, proxies, or compatible endpoints. |
+| `MAX_API_BASE_URL` | MAX Bot API base URL. Defaults to `https://platform-api2.max.ru` (the pre-2026-07-19 host, `platform-api.max.ru`, is retired — override only for tests, proxies, or compatible endpoints). |
 | `MAX_ALLOWED_USERS` | Comma-separated MAX user IDs allowed to talk to the bot. |
 | `MAX_ALLOW_ALL_USERS` | Set to `true` to allow any MAX user. Intended for development only. |
 | `MAX_HOME_CHANNEL` | Default chat ID for cron and notification delivery. |

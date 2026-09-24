@@ -5,7 +5,8 @@ Uses Webhook (POST /subscriptions) or long-polling (GET /updates) for
 receiving messages and REST API (POST /messages) for sending.
 
 API docs: https://dev.max.ru/docs-api
-Base URL: https://platform-api.max.ru
+Base URL: https://platform-api2.max.ru (platform-api.max.ru retired 2026-07-19;
+the old host still answers as of this patch but is not guaranteed to stay up)
 """
 
 import asyncio
@@ -15,6 +16,7 @@ import json
 import logging
 import os
 import re
+import ssl
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -29,10 +31,84 @@ from gateway.platforms.base import (
     SendResult,
 )
 from gateway.config import Platform, PlatformConfig
+from hermes_constants import get_hermes_home
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MAX_API_BASE_URL = "https://platform-api.max.ru"
+# 2026-07-19: MAX moved its Bot API to platform-api2.max.ru, whose cert
+# chains to the Russian Ministry of Digital Development's own root ("Russian
+# Trusted Root CA") — not present in the standard system/Mozilla CA bundle.
+# _max_ssl_context() below extends (not replaces) the default trust store
+# with that root so both the new and the still-answering old host keep
+# working through the transition, instead of failing TLS verification.
+DEFAULT_MAX_API_BASE_URL = "https://platform-api2.max.ru"
+_PLUGIN_DIR = Path(__file__).resolve().parent
+_RUSSIAN_CA_BUNDLE_FILES = (
+    _PLUGIN_DIR / "ca" / "russian_trusted_sub_ca.pem",
+    _PLUGIN_DIR / "ca" / "russian_trusted_root_ca.pem",
+)
+_ssl_context_cache: Optional[ssl.SSLContext] = None
+
+
+def _max_ssl_context() -> ssl.SSLContext:
+    """Build (and cache) an SSL context trusting system CAs plus MAX's
+    Mintsifry-issued chain, so platform-api2.max.ru verifies cleanly without
+    disabling verification for anything else this adapter talks to."""
+    global _ssl_context_cache
+    if _ssl_context_cache is not None:
+        return _ssl_context_cache
+    ctx = ssl.create_default_context()
+    loaded_extra = False
+    for ca_path in _RUSSIAN_CA_BUNDLE_FILES:
+        if not ca_path.exists():
+            continue
+        try:
+            ctx.load_verify_locations(cafile=str(ca_path))
+            loaded_extra = True
+        except ssl.SSLError as exc:
+            logger.warning("Max: failed to load CA bundle %s: %s", ca_path, exc)
+    if not loaded_extra:
+        logger.warning(
+            "Max: Russian Trusted Root CA not found under %s — "
+            "platform-api2.max.ru TLS verification will fail. Expected files: %s",
+            _PLUGIN_DIR / "ca",
+            ", ".join(p.name for p in _RUSSIAN_CA_BUNDLE_FILES),
+        )
+    _ssl_context_cache = ctx
+    return ctx
+
+
+def _max_poll_state_path() -> Path:
+    """Disk location for the long-poll marker (survives gateway restarts)."""
+    return get_hermes_home() / "plugins" / "max" / "state" / "poll_state.json"
+
+
+def _load_persisted_marker() -> int:
+    path = _max_poll_state_path()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        marker = int(data.get("marker", 0))
+        if marker > 0:
+            logger.info("Max: resuming long-poll from persisted marker=%s (%s)", marker, path)
+        return marker
+    except FileNotFoundError:
+        return 0
+    except Exception as exc:
+        logger.warning("Max: could not read persisted marker from %s (%s) — starting at 0", path, exc)
+        return 0
+
+
+def _save_persisted_marker(marker: int) -> None:
+    path = _max_poll_state_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_suffix(".json.tmp")
+        tmp_path.write_text(json.dumps({"marker": marker}), encoding="utf-8")
+        tmp_path.replace(path)
+    except Exception as exc:
+        logger.warning("Max: failed to persist marker=%s to %s: %s", marker, path, exc)
+
+
 DEFAULT_WEBHOOK_HOST = "0.0.0.0"
 DEFAULT_WEBHOOK_PORT = 8650
 DEFAULT_WEBHOOK_PATH = "/max/webhook"
@@ -567,6 +643,7 @@ class MaxAdapter(BasePlatformAdapter):
                 "Authorization": self.token,
             },
             timeout=aiohttp.ClientTimeout(total=120),
+            connector=aiohttp.TCPConnector(ssl=_max_ssl_context()),
         )
 
         # Verify token without consuming updates. MAX requires Authorization header.
@@ -825,12 +902,18 @@ class MaxAdapter(BasePlatformAdapter):
     async def _register_native_commands(self) -> None:
         """Register MAX native command menu entries.
 
-        MAX exposes the slash-command menu from the bot's ``/me.commands`` field,
-        updated with ``PATCH /me``. Keep this list compact: MAX caps it at 32.
+        Was ``PATCH /me`` with an embedded ``commands`` field — that 404s
+        with ``method.not.found`` on platform-api2.max.ru. Current MAX docs
+        (dev.max.ru/docs-api/methods/PATCH/me/commands) split this into its
+        own endpoint; the request/response body shape
+        (``{"commands": [{"name", "description"}, ...]}``, max 32) is
+        unchanged, only the path moved.
         """
-        result = await self._api_patch("/me", {"commands": MAX_NATIVE_COMMANDS})
+        result = await self._api_patch("/me/commands", {"commands": MAX_NATIVE_COMMANDS})
         if result:
             logger.info("Max: native commands registered (%s)", len(MAX_NATIVE_COMMANDS))
+        else:
+            logger.warning("Max: native command registration failed (non-fatal, bot still works)")
 
     async def _send_text_message(
         self,
@@ -1034,7 +1117,11 @@ class MaxAdapter(BasePlatformAdapter):
         try:
             timeout = aiohttp.ClientTimeout(total=30)
             # Use a clean session so MAX bot Authorization is never sent to the CDN host.
-            async with aiohttp.ClientSession(timeout=timeout) as session:
+            # Same extended CA trust as the main session: MAX's media CDN can sit
+            # behind the same Mintsifry-issued chain as the Bot API host.
+            async with aiohttp.ClientSession(
+                timeout=timeout, connector=aiohttp.TCPConnector(ssl=_max_ssl_context())
+            ) as session:
                 async with session.get(url) as resp:
                     if resp.status != 200:
                         logger.warning("Max inbound media download failed: HTTP %s", resp.status)
@@ -1352,7 +1439,11 @@ class MaxAdapter(BasePlatformAdapter):
     async def _poll_loop(self):
         """Long-poll GET /updates with marker."""
         logger.warning("Max: _poll_loop STARTING")
-        marker: int = 0
+        # Resume from the last marker persisted to disk instead of always
+        # starting at 0 — a plain in-memory marker means every gateway
+        # restart either replays the whole update history or (if MAX has
+        # already GC'd it) silently drops whatever arrived while down.
+        marker: int = _load_persisted_marker()
         backoff = 1
         while self._running and self._session:
             try:
@@ -1401,6 +1492,12 @@ class MaxAdapter(BasePlatformAdapter):
                             continue
                         logger.warning(f"Max: about to call _handle_update, update_type={u.get('update_type','?')}")
                         await self._handle_update(u)
+
+                    # Persist after the batch is dispatched (not before) so a
+                    # crash mid-handling replays that batch on restart instead
+                    # of silently skipping it — at-least-once, not at-most-once.
+                    if new_marker is not None:
+                        _save_persisted_marker(marker)
 
             except asyncio.TimeoutError:
                 continue
@@ -1677,6 +1774,74 @@ def _env_enablement() -> dict:
     return data
 
 
+_STANDALONE_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
+_STANDALONE_VOICE_EXTS = {".ogg", ".oga", ".opus"}
+_STANDALONE_VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".avi"}
+
+
+async def _standalone_send(
+    pconfig,
+    chat_id,
+    message,
+    *,
+    thread_id=None,
+    media_files=None,
+    force_document=False,
+):
+    """Out-of-process Max delivery (deliver=max cron jobs, or send_message
+    when the gateway isn't running in this process). Implements the
+    standalone_sender_fn contract from gateway/platforms/ADDING_A_PLATFORM.md
+    — without it, deliver=max cron jobs fail with "No live adapter for
+    platform 'max'" whenever cron runs separately from the gateway (this
+    plugin never registered one). Builds a throwaway MaxAdapter instance and
+    reuses its real send methods (chunking, markdown fallback, attachment
+    upload/retry) instead of re-implementing the MAX REST calls a second
+    time.
+    """
+    adapter = MaxAdapter(pconfig)
+    if not adapter.token:
+        return {"error": "Max: MAX_BOT_TOKEN not set"}
+
+    adapter._session = aiohttp.ClientSession(
+        headers={"Authorization": adapter.token},
+        timeout=aiohttp.ClientTimeout(total=120),
+        connector=aiohttp.TCPConnector(ssl=_max_ssl_context()),
+    )
+    try:
+        results = []
+        caption = message or ""
+        for entry in media_files or []:
+            # send_message_tool's internal helpers pass (path, is_voice)
+            # tuples in some call sites and bare path strings in others —
+            # accept either.
+            path, is_voice = entry if isinstance(entry, (tuple, list)) else (entry, False)
+            ext = Path(str(path)).suffix.lower()
+            if force_document:
+                result = await adapter.send_document(chat_id, file_path=path, caption=caption)
+            elif is_voice or ext in _STANDALONE_VOICE_EXTS:
+                result = await adapter.send_voice(chat_id, path=path, caption=caption)
+            elif ext in _STANDALONE_IMAGE_EXTS:
+                result = await adapter.send_image_file(chat_id, image_path=path, caption=caption)
+            elif ext in _STANDALONE_VIDEO_EXTS:
+                result = await adapter.send_video(chat_id, path=path, caption=caption)
+            else:
+                result = await adapter.send_document(chat_id, file_path=path, caption=caption)
+            caption = ""  # only the first attachment carries the message text as a caption
+            results.append(result)
+            if not result.success:
+                return {"error": result.error or "Max standalone media send failed"}
+
+        if not media_files:
+            results.append(await adapter.send(chat_id, message))
+
+        last = results[-1]
+        if last.success:
+            return {"success": True, "message_id": last.message_id}
+        return {"error": last.error or "Max standalone send failed"}
+    finally:
+        await adapter._session.close()
+
+
 def register(ctx):
     """Register Max Messenger platform adapter."""
     ctx.register_platform(
@@ -1686,6 +1851,7 @@ def register(ctx):
         check_fn=check_requirements,
         validate_config=validate_config,
         env_enablement_fn=_env_enablement,
+        standalone_sender_fn=_standalone_send,
         required_env=["MAX_BOT_TOKEN"],
         install_hint="pip install aiohttp",
         allowed_users_env="MAX_ALLOWED_USERS",
