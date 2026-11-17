@@ -5,7 +5,7 @@ Uses Webhook (POST /subscriptions) or long-polling (GET /updates) for
 receiving messages and REST API (POST /messages) for sending.
 
 API docs: https://dev.max.ru/docs-api
-Base URL: https://platform-api.max.ru
+Base URL: https://platform-api2.max.ru
 """
 
 import asyncio
@@ -32,7 +32,7 @@ from gateway.config import Platform, PlatformConfig
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MAX_API_BASE_URL = "https://platform-api.max.ru"
+DEFAULT_MAX_API_BASE_URL = "https://platform-api2.max.ru"
 DEFAULT_WEBHOOK_HOST = "0.0.0.0"
 DEFAULT_WEBHOOK_PORT = 8650
 DEFAULT_WEBHOOK_PATH = "/max/webhook"

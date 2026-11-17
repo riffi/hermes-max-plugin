@@ -66,7 +66,7 @@ Optional:
 | `MAX_WEBHOOK_PORT` | Local webhook listen port. Defaults to `8650`. |
 | `MAX_WEBHOOK_PATH` | Local webhook path. Defaults to `/max/webhook`. |
 | `MAX_UPDATE_TYPES` | Comma-separated update types. Defaults to `message_created,message_callback,bot_started`. |
-| `MAX_API_BASE_URL` | MAX Bot API base URL. Defaults to `https://platform-api.max.ru`; override for tests, proxies, or compatible endpoints. |
+| `MAX_API_BASE_URL` | MAX Bot API base URL. Defaults to `https://platform-api2.max.ru`; override for tests, proxies, or compatible endpoints. The host must trust the [Russian Trusted Root CA published by Gosuslugi](https://www.gosuslugi.ru/crt). |
 | `MAX_ALLOWED_USERS` | Comma-separated MAX user IDs allowed to talk to the bot. |
 | `MAX_ALLOW_ALL_USERS` | Set to `true` to allow any MAX user. Intended for development only. |
 | `MAX_HOME_CHANNEL` | Default chat ID for cron and notification delivery. |

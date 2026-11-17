@@ -34,7 +34,7 @@ optional_env:
     prompt: "MAX update types"
     password: false
   - name: MAX_API_BASE_URL
-    description: "MAX Bot API base URL (default: https://platform-api.max.ru). Useful for tests, proxies, or compatible endpoints."
+    description: "MAX Bot API base URL (default: https://platform-api2.max.ru). Useful for tests, proxies, or compatible endpoints."
     prompt: "MAX API base URL"
     password: false
   - name: MAX_ALLOWED_USERS

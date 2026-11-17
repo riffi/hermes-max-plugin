@@ -186,3 +186,13 @@ def test_connect_accepts_gateway_reconnect_keyword():
     adapter.token = ""
 
     assert asyncio.run(adapter.connect(is_reconnect=True)) is False
+
+
+def test_default_api_base_url_uses_current_max_endpoint(monkeypatch):
+    module = _load_max_adapter_module()
+    monkeypatch.delenv("MAX_API_BASE_URL", raising=False)
+
+    adapter = module.MaxAdapter(PlatformConfig(enabled=True, token="token"))
+
+    assert module.DEFAULT_MAX_API_BASE_URL == "https://platform-api2.max.ru"
+    assert adapter._api_base_url == "https://platform-api2.max.ru"
