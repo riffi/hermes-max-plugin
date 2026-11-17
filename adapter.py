@@ -825,10 +825,10 @@ class MaxAdapter(BasePlatformAdapter):
     async def _register_native_commands(self) -> None:
         """Register MAX native command menu entries.
 
-        MAX exposes the slash-command menu from the bot's ``/me.commands`` field,
-        updated with ``PATCH /me``. Keep this list compact: MAX caps it at 32.
+        MAX exposes the slash-command menu through ``PATCH /me/commands``.
+        Keep this list compact: MAX caps it at 32.
         """
-        result = await self._api_patch("/me", {"commands": MAX_NATIVE_COMMANDS})
+        result = await self._api_patch("/me/commands", {"commands": MAX_NATIVE_COMMANDS})
         if result:
             logger.info("Max: native commands registered (%s)", len(MAX_NATIVE_COMMANDS))
 
